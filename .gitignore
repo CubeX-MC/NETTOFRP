@@ -1,0 +1,15 @@
+# 编译产物
+/dist/
+/nettofrp
+*.exe
+
+# 日志
+*.log
+
+# 真实配置（含线路地址），仅提交 config.example.json
+/config.json
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

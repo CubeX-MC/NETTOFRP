@@ -1,0 +1,19 @@
+{
+  "listen": "0.0.0.0:25565",
+  "mc_host": "auto.example.org",
+  "probe_interval_seconds": 15,
+  "probe_samples": 5,
+  "probe_timeout_ms": 2000,
+  "enable_transfer": true,
+  "transfer_packet_id": 11,
+  "weights": {
+    "latency": 0.6,
+    "stability": 0.3,
+    "bandwidth": 0.1
+  },
+  "lines": [
+    { "name": "play1", "address": "play1.example.org:25565" },
+    { "name": "play2", "address": "play2.example.org:25565" },
+    { "name": "play-srv", "address": "play.example.org", "srv": true }
+  ]
+}
