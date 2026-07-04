@@ -55,15 +55,17 @@ cp config.example.json config.json
   "probe_timeout_ms": 2000,
   "enable_transfer": true,
   "transfer_packet_id": 11,
+  "enable_proxy_protocol": false,
+  "geoip_db": "",
   "weights": {
     "latency": 0.6,
     "stability": 0.3,
     "bandwidth": 0.1
   },
   "lines": [
-    { "name": "play2", "address": "play2.cubexmc.org:25565" },
-    { "name": "play3", "address": "play3.cubexmc.org:25565" },
-    { "name": "play-srv", "address": "play.cubexmc.org", "srv": true }
+    { "name": "play2", "address": "play2.cubexmc.org:25565", "regions": ["CN-ZJ"] },
+    { "name": "play3", "address": "play3.cubexmc.org:25565", "regions": ["CN-GD"] },
+    { "name": "play-srv", "address": "play.cubexmc.org", "srv": true, "regions": ["CN"] }
   ]
 }
 ```
@@ -76,8 +78,26 @@ cp config.example.json config.json
 | `probe_timeout_ms` | 单次建连超时，同时用作转发建连超时 |
 | `enable_transfer` | 是否对 1.20.5+ 客户端启用 Transfer 直连 |
 | `transfer_packet_id` | configuration 状态 Transfer 包 ID，1.20.5~1.21.x 为 `11`(0x0B)。**未来版本包 ID 若变动，改此处即可，无需改代码** |
+| `enable_proxy_protocol` | 是否解析连接首部的 Proxy Protocol V1 头以获取玩家真实 IP。仅在 NETTOFRP 前置了会发送 PROXY 头的代理（如 frp 开启 `proxy_protocol`、HAProxy）时开启；直连场景保持 `false` |
+| `geoip_db` | MaxMind GeoLite2-City 数据库(.mmdb)路径。非空时启用地理选路：按玩家真实 IP 定位区域，优先选同区线路。为空则不启用 |
 | `weights` | 三项指标权重 |
 | `lines[].srv` | 为 `true` 时 `address` 只填域名，程序查询 `_minecraft._tcp.<域名>` 的 SRV 记录获得真实 host:port |
+| `lines[].regions` | 该线路适合服务的区域标记（如 `["CN-ZJ", "CN-SH"]`）。启用地理选路时，玩家区域命中任一标记的线路优先。标 `"CN"` 命中全国玩家；留空表示通用线路（任何玩家都可回落到它） |
+
+### 地理选路（可选）
+
+默认模型是「全局最优单入口」：所有玩家共享同一条最优线路。启用 `geoip_db` + `enable_proxy_protocol` 后升级为「按玩家区域选路」——不同地区的玩家各自优先连本区线路。
+
+工作流程：
+1. 前置代理通过 Proxy Protocol V1 把玩家真实 IP 传给 NETTOFRP（否则拿到的是前置代理的 IP，选路失真）。
+2. 用 GeoLite2-City 库把 IP 定位到区域（如 `CN-ZJ`）。
+3. 候选线路重排序：`regions` 命中玩家区域的整体前移，组内仍按探测评分排序；其余线路（含未标记 `regions` 的通用线路）按评分接在其后，保留跨区故障转移。
+
+前提与注意：
+- **必须有前置代理发送 PROXY 头**，否则 `enable_proxy_protocol` 拿不到真实 IP，会回落用 socket 远端地址（即前置代理 IP），地理选路无意义。
+- GeoLite2-City 库需自行从 MaxMind 下载（免费，需注册），放到服务器上并在 `geoip_db` 指定路径。库文件本地读取，玩家 IP 不外传。
+- 区域标记用 ISO 码：国家用两位（`CN`、`US`），省/州用 `国家-代码`（`CN-ZJ` 浙江、`CN-GD` 广东、`CN-SH` 上海）。
+- 定位失败或未配置 `geoip_db` 时，自动退回全局评分排序，不影响可用性。
 
 ## 构建与运行
 

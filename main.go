@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"nettofrp/internal/config"
+	"nettofrp/internal/geoip"
 	"nettofrp/internal/prober"
+	"nettofrp/internal/proxy"
 	"nettofrp/internal/resolver"
 	"nettofrp/internal/selector"
-	"nettofrp/internal/proxy"
 )
 
 // version 在发布构建时由 -ldflags "-X main.version=..." 注入，本地构建为 dev。
@@ -37,6 +38,24 @@ func main() {
 	pb := prober.New(cfg, res)
 	sel := selector.New(cfg)
 
+	// 可选地理选路：配置了 geoip_db 且加载成功时启用，否则以 nil 传入（不做地理选路）。
+	var geo *geoip.DB
+	if cfg.GeoIPDB != "" {
+		g, err := geoip.Open(cfg.GeoIPDB)
+		if err != nil {
+			log.Fatalf("加载 GeoIP 数据库失败: %v", err)
+		}
+		geo = g
+		defer geo.Close()
+		log.Printf("[main] 已启用地理选路，GeoIP 库: %s", cfg.GeoIPDB)
+	}
+
+	// proxy.New 接受 RegionLocator 接口；geo 为 nil 时需显式传 nil 接口值。
+	var locator proxy.RegionLocator
+	if geo != nil {
+		locator = geo
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -44,7 +63,7 @@ func main() {
 	runProbe(cfg, pb, sel)
 	go probeLoop(ctx, cfg, pb, sel)
 
-	px := proxy.New(cfg, sel, res)
+	px := proxy.New(cfg, sel, res, locator)
 
 	go handleSignals(cancel)
 

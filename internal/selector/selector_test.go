@@ -107,3 +107,73 @@ func TestCandidatesOrdered(t *testing.T) {
 		}
 	}
 }
+
+// names 抽取线路名列表，便于断言顺序。
+func names(lines []config.Line) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = l.Name
+	}
+	return out
+}
+
+// 同区线路应整体前移到候选前列，即便其评分低于跨区线路；
+// 组内仍按评分排序，未标记 Regions 的通用线路排在同区线路之后。
+func TestCandidatesForRegionPrefersSameRegion(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		// 跨区线路评分最高（延迟最低）。
+		{Line: config.Line{Name: "gd-fast", Regions: []string{"CN-GD"}}, Reachable: true,
+			AvgLatency: 10 * time.Millisecond, SuccessRate: 1},
+		// 同区线路评分次之。
+		{Line: config.Line{Name: "zj-mid", Regions: []string{"CN-ZJ"}}, Reachable: true,
+			AvgLatency: 60 * time.Millisecond, SuccessRate: 1},
+		// 通用线路（无 Regions），评分居中。
+		{Line: config.Line{Name: "any", Regions: nil}, Reachable: true,
+			AvgLatency: 40 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForRegion("CN-ZJ"))
+	// 同区 zj-mid 前移到首位，其余按原评分顺序：gd-fast(10ms) > any(40ms)。
+	want := []string{"zj-mid", "gd-fast", "any"}
+	for i := range want {
+		if i >= len(got) || got[i] != want[i] {
+			t.Fatalf("期望 %v，实际 %v", want, got)
+		}
+	}
+}
+
+// 线路以国家码 "CN" 标记时，应命中同国家任意省份的玩家。
+func TestCandidatesForRegionCountryLevelMatch(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		{Line: config.Line{Name: "overseas", Regions: []string{"US"}}, Reachable: true,
+			AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: config.Line{Name: "cn-any", Regions: []string{"CN"}}, Reachable: true,
+			AvgLatency: 80 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForRegion("CN-ZJ"))
+	if len(got) == 0 || got[0] != "cn-any" {
+		t.Fatalf("期望 CN 标记线路 cn-any 命中 CN-ZJ 玩家并前移，实际 %v", got)
+	}
+}
+
+// region 为空（无法定位）时应退化为普通评分排序。
+func TestCandidatesForRegionEmptyFallsBack(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		{Line: config.Line{Name: "a", Regions: []string{"CN-ZJ"}}, Reachable: true,
+			AvgLatency: 100 * time.Millisecond, SuccessRate: 1},
+		{Line: config.Line{Name: "b", Regions: []string{"CN-GD"}}, Reachable: true,
+			AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForRegion(""))
+	want := []string{"b", "a"} // 纯按评分
+	for i := range want {
+		if i >= len(got) || got[i] != want[i] {
+			t.Fatalf("期望 %v，实际 %v", want, got)
+		}
+	}
+}

@@ -91,7 +91,7 @@ func TestProxyFallbackTCP(t *testing.T) {
 		{Line: cfg.Lines[0], Reachable: true, AvgLatency: 10 * time.Millisecond, SuccessRate: 1},
 	})
 
-	px := New(&cfg2, sel, resolver.New(&cfg2))
+	px := New(&cfg2, sel, resolver.New(&cfg2), nil)
 	addr, closeProxy := startProxy(t, px)
 	defer closeProxy()
 
@@ -145,7 +145,7 @@ func TestProxyTransfer(t *testing.T) {
 		{Line: cfg.Lines[0], Reachable: true, AvgLatency: 10 * time.Millisecond, SuccessRate: 1},
 	})
 
-	px := New(cfg, sel, resolver.New(cfg))
+	px := New(cfg, sel, resolver.New(cfg), nil)
 	addr, closeProxy := startProxy(t, px)
 	defer closeProxy()
 

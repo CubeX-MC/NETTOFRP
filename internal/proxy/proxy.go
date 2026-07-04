@@ -19,6 +19,12 @@ type Resolver interface {
 	Resolve(line config.Line) (string, error)
 }
 
+// RegionLocator 将 IP 解析为区域标记（如 "CN-ZJ"），无法定位时返回空串。
+// 由 geoip.DB 实现；为 nil 时代理不做地理选路。
+type RegionLocator interface {
+	Region(ip net.IP) string
+}
+
 // Proxy 在监听端口上接受玩家连接，作为多条线路统一的 "auto" 入口。
 //
 // 对支持 Transfer 的客户端（协议 ≥766，即 1.20.5+），代理在登录阶段直接下发
@@ -32,10 +38,12 @@ type Proxy struct {
 	dialTO           time.Duration
 	enableTransfer   bool
 	transferPacketID int32
+	enableProxyProto bool
+	geo              RegionLocator
 }
 
-// New 创建 auto 反向代理。
-func New(cfg *config.Config, sel *selector.Selector, r Resolver) *Proxy {
+// New 创建 auto 反向代理。geo 可为 nil，表示不启用地理选路。
+func New(cfg *config.Config, sel *selector.Selector, r Resolver, geo RegionLocator) *Proxy {
 	return &Proxy{
 		listenAddr:       cfg.Listen,
 		sel:              sel,
@@ -43,6 +51,8 @@ func New(cfg *config.Config, sel *selector.Selector, r Resolver) *Proxy {
 		dialTO:           cfg.ProbeTimeoutDuration(),
 		enableTransfer:   cfg.EnableTransfer,
 		transferPacketID: int32(cfg.TransferPacketID),
+		enableProxyProto: cfg.EnableProxyProtocol,
+		geo:              geo,
 	}
 }
 
@@ -68,10 +78,21 @@ func (p *Proxy) handle(client net.Conn) {
 	defer client.Close()
 
 	br := bufio.NewReader(client)
+
+	// Proxy Protocol V1 头（若启用）位于任何 MC 数据之前，须最先解析。
+	// 取到真实源 IP 用于地理选路；未启用或无合法头时回落 socket 远端地址。
+	realIP := p.clientIP(client, br)
+
 	hs, err := mcproto.ReadHandshake(br)
 	if err != nil {
 		log.Printf("[proxy] 读取握手失败，关闭 %s: %v", client.RemoteAddr(), err)
 		return
+	}
+
+	// 依据真实 IP 定位玩家区域，据此对候选线路重排序（同区优先）。
+	region := ""
+	if p.geo != nil && realIP != nil {
+		region = p.geo.Region(realIP)
 	}
 
 	// 仅对「开启 Transfer + 登录意图 + 客户端支持 Transfer」的连接走直连优化；
@@ -80,7 +101,7 @@ func (p *Proxy) handle(client net.Conn) {
 		hs.NextState == mcproto.StateLogin &&
 		hs.ProtocolVersion >= mcproto.TransferMinProtocol
 
-	candidates := p.sel.Candidates()
+	candidates := p.sel.CandidatesForRegion(region)
 
 	if eligible && len(candidates) > 0 {
 		if p.tryTransfer(client, br, hs, candidates) {
@@ -91,6 +112,20 @@ func (p *Proxy) handle(client net.Conn) {
 	}
 
 	p.fallbackTCP(client, br, hs, candidates)
+}
+
+// clientIP 返回玩家真实 IP：启用 Proxy Protocol 且成功解析首行时取其中的源 IP，
+// 否则回落到 socket 连接的远端 IP。
+func (p *Proxy) clientIP(client net.Conn, br *bufio.Reader) net.IP {
+	if p.enableProxyProto {
+		if ip := readProxyProtocolV1(br); ip != nil {
+			return ip
+		}
+	}
+	if addr, ok := client.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP
+	}
+	return nil
 }
 
 // tryTransfer 执行离线登录并向客户端下发 Transfer 包，令其直连最优线路。

@@ -2,6 +2,7 @@ package selector
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,45 @@ func (s *Selector) Candidates() []config.Line {
 		}
 	}
 	return lines
+}
+
+// CandidatesForRegion 返回按玩家区域优化排序的可达线路列表。
+//
+// 在 Candidates（按评分降序）的基础上做稳定分组：Regions 命中玩家区域的线路整体
+// 前移，其余线路（含未标记 Regions 的通用线路）保持原评分顺序接在其后。组内仍按
+// 评分排序，因此「同区且质量好」的线路最优先，同时保留跨区故障转移能力。
+// region 为空（无法定位）时退化为普通 Candidates。
+func (s *Selector) CandidatesForRegion(region string) []config.Line {
+	all := s.Candidates()
+	if region == "" {
+		return all
+	}
+
+	preferred := make([]config.Line, 0, len(all))
+	rest := make([]config.Line, 0, len(all))
+	for _, line := range all {
+		if regionMatch(line.Regions, region) {
+			preferred = append(preferred, line)
+		} else {
+			rest = append(rest, line)
+		}
+	}
+	return append(preferred, rest...)
+}
+
+// regionMatch 判断线路的区域标记是否命中玩家区域。
+// 玩家区域形如 "CN-ZJ"；线路标记 "CN-ZJ" 精确命中，标记 "CN" 命中同国家的玩家。
+func regionMatch(lineRegions []string, playerRegion string) bool {
+	country := playerRegion
+	if i := strings.IndexByte(playerRegion, '-'); i > 0 {
+		country = playerRegion[:i]
+	}
+	for _, r := range lineRegions {
+		if r == playerRegion || r == country {
+			return true
+		}
+	}
+	return false
 }
 
 // Ranking 返回当前排名快照，供日志或状态查询使用。

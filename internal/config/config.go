@@ -21,6 +21,10 @@ type Line struct {
 	// SRV 为 true 时，Address 是一个域名（不含端口），
 	// 真实的 host:port 需通过查询 _minecraft._tcp.<Address> 的 SRV 记录获得。
 	SRV bool `json:"srv"`
+	// Regions 是该线路适合服务的区域标记（如 "CN-ZJ"、"CN-GD"、"CN"）。
+	// 启用 GeoIP 选路时，玩家所在区域命中其中任一标记的线路会被优先选择。
+	// 为空表示不限定区域，可服务任意玩家（作为通用回落线路）。
+	Regions []string `json:"regions"`
 }
 
 // Config 是程序的完整配置。
@@ -41,6 +45,17 @@ type Config struct {
 	// TransferPacketID 是 configuration 状态下 Transfer 包的 ID。
 	// 1.20.5~1.21.x 为 0x0B(11)。未来版本若包 ID 变动，可在此覆盖而无需改代码。
 	TransferPacketID int `json:"transfer_packet_id"`
+
+	// EnableProxyProtocol 为 true 时，将每个新连接的首行按 Proxy Protocol V1
+	// 解析以获取玩家真实源 IP（适用于 NETTOFRP 前置了会发送 PROXY 头的代理，
+	// 如 frp 开启 proxy_protocol 或 HAProxy）。读不到合法 PROXY 头时回落使用
+	// socket 的远端地址。仅在确有前置代理发送 PROXY 头时开启。
+	EnableProxyProtocol bool `json:"enable_proxy_protocol"`
+
+	// GeoIPDB 是 MaxMind GeoLite2-City 数据库(.mmdb)的路径。非空且文件可加载时，
+	// 启用基于玩家真实 IP 的地理选路：优先选择 Regions 命中玩家所在区域的线路。
+	// 为空则不做地理选路，沿用全局评分排序。
+	GeoIPDB string `json:"geoip_db"`
 }
 
 // ProbeIntervalDuration 返回探测周期的 time.Duration 形式。
