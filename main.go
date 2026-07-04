@@ -19,9 +19,14 @@ import (
 	"nettofrp/internal/proxy"
 )
 
+// version 在发布构建时由 -ldflags "-X main.version=..." 注入，本地构建为 dev。
+var version = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径")
 	flag.Parse()
+
+	log.Printf("[main] NETTOFRP %s 启动", version)
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
