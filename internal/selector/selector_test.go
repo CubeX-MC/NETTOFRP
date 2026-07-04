@@ -215,3 +215,46 @@ func TestCandidatesForRegionProximityRespectsScore(t *testing.T) {
 		t.Fatalf("近但极慢的线路不应被硬选，期望首选 bj-fast，实际 %v", got)
 	}
 }
+
+// 广州(约 23.13,113.26)玩家应就近选广东线路。即使北京线路 prober 延迟极低
+// （AvgLatency 远小于广东），也不应被选中——这正是"NETTOFRP 部署在北京 →
+// prober 测得北京延迟最低 → 所有玩家被拉去北京"的复现场景。CandidatesForPlayer
+// 按玩家真实坐标就近选路，不使用 prober 延迟，故广东线路应稳定胜出。
+func TestCandidatesForPlayerIgnoresProberLatency(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		// 北京线路：prober 延迟极低（NETTOFRP 就在北京），成功率满分。
+		{Line: config.Line{Name: "bj", Regions: []string{"CN-BJ"}}, Reachable: true,
+			AvgLatency: 2 * time.Millisecond, SuccessRate: 1},
+		// 广东线路：prober 延迟偏高，但离广州玩家最近，健康度同样满分。
+		{Line: config.Line{Name: "gd", Regions: []string{"CN-GD"}}, Reachable: true,
+			AvgLatency: 60 * time.Millisecond, SuccessRate: 1},
+	})
+
+	// 广州坐标。
+	got := names(s.CandidatesForPlayer(23.13, 113.26))
+	if len(got) == 0 || got[0] != "gd" {
+		t.Fatalf("广州玩家应就近选广东 gd（不受北京 prober 低延迟干扰），实际 %v", got)
+	}
+}
+
+// 就近为主但健康度仍作调节：最近的线路若成功率极低（不稳定），
+// 不应仅凭距离硬胜出。北京玩家面对「近但频繁掉线的北京(成功率0.2)」与
+// 「稍远但稳定的天津(成功率1)」，综合权衡后应避开极不稳定的北京线路。
+func TestCandidatesForPlayerHealthAdjusts(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		// 北京离玩家最近，但成功率极低。
+		{Line: config.Line{Name: "bj-flaky", Regions: []string{"CN-BJ"}}, Reachable: true,
+			AvgLatency: 20 * time.Millisecond, Jitter: 80 * time.Millisecond, SuccessRate: 0.2},
+		// 天津紧邻北京（约 39.13,117.20），距离几乎相同，但完全稳定。
+		{Line: config.Line{Name: "tj-steady", Regions: []string{"CN-TJ"}}, Reachable: true,
+			AvgLatency: 20 * time.Millisecond, Jitter: 2 * time.Millisecond, SuccessRate: 1},
+	})
+
+	// 北京玩家坐标。
+	got := names(s.CandidatesForPlayer(39.90, 116.41))
+	if len(got) == 0 || got[0] != "tj-steady" {
+		t.Fatalf("距离几乎相同时，极不稳定线路不应胜出，期望 tj-steady，实际 %v", got)
+	}
+}

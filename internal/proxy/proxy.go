@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"nettofrp/internal/config"
+	"nettofrp/internal/geoip"
 	"nettofrp/internal/mcproto"
 	"nettofrp/internal/selector"
 )
@@ -19,10 +20,10 @@ type Resolver interface {
 	Resolve(line config.Line) (string, error)
 }
 
-// RegionLocator 将 IP 解析为区域标记（如 "CN-ZJ"），无法定位时返回空串。
+// RegionLocator 将 IP 解析为地理位置（经纬度 + 区域标记）。
 // 由 geoip.DB 实现；为 nil 时代理不做地理选路。
 type RegionLocator interface {
-	Region(ip net.IP) string
+	Locate(ip net.IP) geoip.Location
 }
 
 // Proxy 在监听端口上接受玩家连接，作为多条线路统一的 "auto" 入口。
@@ -89,13 +90,14 @@ func (p *Proxy) handle(client net.Conn) {
 		return
 	}
 
-	// 依据真实 IP 定位玩家区域，据此对候选线路重排序（同区优先）。
-	region := ""
+	// 依据真实 IP 定位玩家位置，据此对候选线路重排序（就近优先）。
+	var loc geoip.Location
 	if p.geo != nil && realIP != nil {
-		region = p.geo.Region(realIP)
+		loc = p.geo.Locate(realIP)
 	}
 	if p.enableProxyProto || p.geo != nil {
-		log.Printf("[proxy] 连接来源 %s，真实IP=%s，识别区域=%q", client.RemoteAddr(), maskIP(realIP), region)
+		log.Printf("[proxy] 连接来源 %s，真实IP=%s，识别区域=%q，有坐标=%t",
+			client.RemoteAddr(), maskIP(realIP), loc.Region, loc.HasCoord)
 	}
 
 	// 仅对「开启 Transfer + 登录意图 + 客户端支持 Transfer」的连接走直连优化；
@@ -104,7 +106,15 @@ func (p *Proxy) handle(client net.Conn) {
 		hs.NextState == mcproto.StateLogin &&
 		hs.ProtocolVersion >= mcproto.TransferMinProtocol
 
-	candidates := p.sel.CandidatesForRegion(region)
+	// 优先按玩家真实坐标就近选路（不受 prober→线路 延迟干扰）；
+	// 取不到坐标时降级到按区域标记选路；无地理信息时退化为全局评分。
+	var candidates []config.Line
+	switch {
+	case loc.HasCoord:
+		candidates = p.sel.CandidatesForPlayer(loc.Lat, loc.Lon)
+	default:
+		candidates = p.sel.CandidatesForRegion(loc.Region)
+	}
 
 	if eligible && len(candidates) > 0 {
 		if p.tryTransfer(client, br, hs, candidates) {

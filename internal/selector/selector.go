@@ -117,6 +117,56 @@ func linesOf(scored []Scored) []config.Line {
 	return lines
 }
 
+// playerGeoWeight 是「就近」在玩家综合分中的权重，其余归健康度。取 0.8：
+// Transfer 直连下玩家延迟由「玩家↔线路」的地理距离主导，健康度只作稳定性调节。
+const playerGeoWeight = 0.8
+
+// healthScore 返回线路健康度 [0,100]：只含成功率(0.7) + 抖动(0.3)，
+// 刻意不含 prober 延迟。prober 测的是「NETTOFRP→线路」延迟，而 Transfer 直连下
+// 玩家走的是「玩家→线路」，两者无关；用 prober 延迟给玩家选路会把所有玩家
+// 拉向「离 NETTOFRP 近」的线路，与玩家实际就近无关。
+func healthScore(m prober.Metrics) float64 {
+	jitScore := invRef(float64(m.Jitter), float64(refJitter))
+	stab := 0.7*m.SuccessRate + 0.3*jitScore
+	return stab * 100
+}
+
+// lineDistance 返回线路到给定坐标的最近距离（公里）。线路可标多个 Regions，
+// 取其中最近的一个。无任何可定位 Regions 时返回 math.MaxFloat64（视为最远）。
+func lineDistance(line config.Line, plat, plon float64) float64 {
+	best := math.MaxFloat64
+	for _, r := range line.Regions {
+		if lat, lon, ok := regionCoord(r); ok {
+			if d := haversine(plat, plon, lat, lon); d < best {
+				best = d
+			}
+		}
+	}
+	return best
+}
+
+// CandidatesForPlayer 按玩家真实坐标就近 + 线路健康度排序候选。
+// 综合分 = playerGeoWeight*(1 - 归一化距离) + (1-playerGeoWeight)*(健康度/100)。
+//
+// 这是启用地理选路且成功取到玩家经纬度时的首选路径：直接以玩家实际位置就近选线，
+// 完全不受 prober「NETTOFRP→线路」延迟干扰，从根本上避免所有玩家被拉向同一条
+// 「离中转机近」的线路。健康度仅作次要调节，使又近又不稳的线路不至于硬胜出。
+// 无可定位 Regions 的线路距离项记 0（视为最远），仅凭健康度参与排序。
+func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
+	scored := s.candidatesScored()
+	combined := func(sc Scored) float64 {
+		var proximity float64
+		if d := lineDistance(sc.Metrics.Line, plat, plon); d != math.MaxFloat64 {
+			proximity = clamp01(1 - d/refMaxDist)
+		}
+		return playerGeoWeight*proximity + (1-playerGeoWeight)*(healthScore(sc.Metrics)/100)
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return combined(scored[i]) > combined(scored[j])
+	})
+	return linesOf(scored)
+}
+
 // geoWeight 是「地理就近」在兜底综合分中的权重，其余归评分。取 0.5 平衡二者，
 // 使又近又慢的线路不会仅凭距离胜出。
 const geoWeight = 0.5
