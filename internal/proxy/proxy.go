@@ -94,6 +94,9 @@ func (p *Proxy) handle(client net.Conn) {
 	if p.geo != nil && realIP != nil {
 		region = p.geo.Region(realIP)
 	}
+	if p.enableProxyProto || p.geo != nil {
+		log.Printf("[proxy] 连接来源 %s，真实IP=%s，识别区域=%q", client.RemoteAddr(), maskIP(realIP), region)
+	}
 
 	// 仅对「开启 Transfer + 登录意图 + 客户端支持 Transfer」的连接走直连优化；
 	// 其余（状态查询、旧版本客户端、开关关闭）一律回落纯 TCP 透传。
@@ -126,6 +129,21 @@ func (p *Proxy) clientIP(client net.Conn, br *bufio.Reader) net.IP {
 		return addr.IP
 	}
 	return nil
+}
+
+// maskIP 对真实 IP 做脱敏，仅用于日志：IPv4 隐去中间两段（39.1.2.27 -> 39.*.*.27），
+// IPv6 仅保留前两字节，避免完整地址落盘。nil 时返回 "-"。
+func maskIP(ip net.IP) string {
+	if ip == nil {
+		return "-"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return strconv.Itoa(int(v4[0])) + ".*.*." + strconv.Itoa(int(v4[3]))
+	}
+	if len(ip) == net.IPv6len {
+		return strconv.Itoa(int(ip[0])) + strconv.Itoa(int(ip[1])) + ":*:*"
+	}
+	return "*"
 }
 
 // tryTransfer 执行离线登录并向客户端下发 Transfer 包，令其直连最优线路。

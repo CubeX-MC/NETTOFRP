@@ -1,6 +1,7 @@
 package selector
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -66,9 +67,10 @@ func (s *Selector) Candidates() []config.Line {
 // CandidatesForRegion 返回按玩家区域优化排序的可达线路列表。
 //
 // 在 Candidates（按评分降序）的基础上做稳定分组：Regions 命中玩家区域的线路整体
-// 前移，其余线路（含未标记 Regions 的通用线路）保持原评分顺序接在其后。组内仍按
-// 评分排序，因此「同区且质量好」的线路最优先，同时保留跨区故障转移能力。
-// region 为空（无法定位）时退化为普通 Candidates。
+// 前移，其余线路（含未标记 Regions 的通用线路）按「地理就近 + 评分」排序接在其后。
+// 组内命中线路仍按评分排序，因此「同区且质量好」的线路最优先，同时保留跨区故障转移。
+// 当玩家所在区域没有任何同区线路时，其余线路按到玩家的地理距离升序排列（距离相近时
+// 按评分降序），实现「就近 + 延迟」兜底。region 为空（无法定位）时退化为普通 Candidates。
 func (s *Selector) CandidatesForRegion(region string) []config.Line {
 	all := s.Candidates()
 	if region == "" {
@@ -84,7 +86,36 @@ func (s *Selector) CandidatesForRegion(region string) []config.Line {
 			rest = append(rest, line)
 		}
 	}
+
+	// 无同区线路时，对其余线路按到玩家的地理距离就近排序（原顺序即评分降序，
+	// 作为距离相近或无坐标时的次级依据，sort.SliceStable 保持其稳定性）。
+	if len(preferred) == 0 {
+		sortByProximity(rest, region)
+	}
 	return append(preferred, rest...)
+}
+
+// sortByProximity 依据线路首个可定位区域到玩家区域的地理距离升序稳定排序。
+// 无法定位坐标的线路（未标 Regions 或坐标未知）视为最远，排在末尾但保持原评分顺序。
+func sortByProximity(lines []config.Line, playerRegion string) {
+	plat, plon, pok := regionCoord(playerRegion)
+	if !pok {
+		return // 玩家坐标未知，维持评分顺序
+	}
+	dist := func(l config.Line) float64 {
+		best := math.MaxFloat64
+		for _, r := range l.Regions {
+			if lat, lon, ok := regionCoord(r); ok {
+				if d := haversine(plat, plon, lat, lon); d < best {
+					best = d
+				}
+			}
+		}
+		return best
+	}
+	sort.SliceStable(lines, func(i, j int) bool {
+		return dist(lines[i]) < dist(lines[j])
+	})
 }
 
 // regionMatch 判断线路的区域标记是否命中玩家区域。

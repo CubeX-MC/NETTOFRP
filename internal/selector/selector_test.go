@@ -177,3 +177,22 @@ func TestCandidatesForRegionEmptyFallsBack(t *testing.T) {
 		}
 	}
 }
+
+// 玩家所在区域无同区线路时，其余线路应按地理就近排序：河南(CN-HA)玩家
+// 应优先分到地理更近的山东(CN-SD)线路，而非评分更高但更远的广东(CN-GD)线路。
+func TestCandidatesForRegionProximityFallback(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		// 广东线路评分最高（延迟最低），但离河南远。
+		{Line: config.Line{Name: "gd", Regions: []string{"CN-GD"}}, Reachable: true,
+			AvgLatency: 10 * time.Millisecond, SuccessRate: 1},
+		// 山东线路评分次之，但离河南近。
+		{Line: config.Line{Name: "sd", Regions: []string{"CN-SD"}}, Reachable: true,
+			AvgLatency: 40 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForRegion("CN-HA"))
+	if len(got) == 0 || got[0] != "sd" {
+		t.Fatalf("河南玩家无同区线路时应就近选山东 sd，实际 %v", got)
+	}
+}

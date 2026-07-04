@@ -9,6 +9,9 @@
 # 真实配置（含线路地址），仅提交 config.example.json
 /config.json
 
+# GeoIP 数据库（运行时数据，体积大，不入仓库）
+*.mmdb
+
 # 编辑器 / 系统
 .DS_Store
 .idea/
