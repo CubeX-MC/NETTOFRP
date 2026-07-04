@@ -67,54 +67,89 @@ func (s *Selector) Candidates() []config.Line {
 // CandidatesForRegion 返回按玩家区域优化排序的可达线路列表。
 //
 // 在 Candidates（按评分降序）的基础上做稳定分组：Regions 命中玩家区域的线路整体
-// 前移，其余线路（含未标记 Regions 的通用线路）按「地理就近 + 评分」排序接在其后。
+// 前移，其余线路（含未标记 Regions 的通用线路）按「地理就近 + 评分」综合权衡排序接在其后。
 // 组内命中线路仍按评分排序，因此「同区且质量好」的线路最优先，同时保留跨区故障转移。
-// 当玩家所在区域没有任何同区线路时，其余线路按到玩家的地理距离升序排列（距离相近时
-// 按评分降序），实现「就近 + 延迟」兜底。region 为空（无法定位）时退化为普通 Candidates。
+// 当玩家所在区域没有任何同区线路时，其余线路按「距离越近 + 评分越高越优」的综合分排序，
+// 避免被分到又近又慢的线路。region 为空（无法定位）时退化为普通 Candidates。
 func (s *Selector) CandidatesForRegion(region string) []config.Line {
-	all := s.Candidates()
+	scored := s.candidatesScored()
 	if region == "" {
-		return all
+		return linesOf(scored)
 	}
 
-	preferred := make([]config.Line, 0, len(all))
-	rest := make([]config.Line, 0, len(all))
-	for _, line := range all {
-		if regionMatch(line.Regions, region) {
-			preferred = append(preferred, line)
+	preferred := make([]Scored, 0, len(scored))
+	rest := make([]Scored, 0, len(scored))
+	for _, sc := range scored {
+		if regionMatch(sc.Metrics.Line.Regions, region) {
+			preferred = append(preferred, sc)
 		} else {
-			rest = append(rest, line)
+			rest = append(rest, sc)
 		}
 	}
 
-	// 无同区线路时，对其余线路按到玩家的地理距离就近排序（原顺序即评分降序，
-	// 作为距离相近或无坐标时的次级依据，sort.SliceStable 保持其稳定性）。
+	// 无同区线路时，对其余线路按「地理就近 + 评分」综合分排序（越大越优）。
 	if len(preferred) == 0 {
 		sortByProximity(rest, region)
 	}
-	return append(preferred, rest...)
+	return linesOf(append(preferred, rest...))
 }
 
-// sortByProximity 依据线路首个可定位区域到玩家区域的地理距离升序稳定排序。
-// 无法定位坐标的线路（未标 Regions 或坐标未知）视为最远，排在末尾但保持原评分顺序。
-func sortByProximity(lines []config.Line, playerRegion string) {
+// candidatesScored 返回当前所有可达线路及其评分，按评分从高到低排序。
+func (s *Selector) candidatesScored() []Scored {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Scored, 0, len(s.ranking))
+	for _, sc := range s.ranking {
+		if sc.Metrics.Reachable {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+// linesOf 抽取评分列表中的线路，保持顺序。
+func linesOf(scored []Scored) []config.Line {
+	lines := make([]config.Line, len(scored))
+	for i, sc := range scored {
+		lines[i] = sc.Metrics.Line
+	}
+	return lines
+}
+
+// geoWeight 是「地理就近」在兜底综合分中的权重，其余归评分。取 0.5 平衡二者，
+// 使又近又慢的线路不会仅凭距离胜出。
+const geoWeight = 0.5
+
+// refMaxDist 是距离归一化的参考上限（公里）：约为中国东西跨度，用于把大圆距离
+// 线性映射到 [0,1]。仅用于相对比较，无需精确。
+const refMaxDist = 5000.0
+
+// sortByProximity 对无同区线路的候选按「地理就近 + 评分」综合分降序稳定排序。
+// 综合分 = geoWeight*(1 - 归一化距离) + (1-geoWeight)*(评分/100)。
+// 无法定位坐标的线路（未标 Regions 或坐标未知）距离项记 0，仅凭评分参与排序。
+func sortByProximity(scored []Scored, playerRegion string) {
 	plat, plon, pok := regionCoord(playerRegion)
 	if !pok {
 		return // 玩家坐标未知，维持评分顺序
 	}
-	dist := func(l config.Line) float64 {
+	combined := func(sc Scored) float64 {
 		best := math.MaxFloat64
-		for _, r := range l.Regions {
+		for _, r := range sc.Metrics.Line.Regions {
 			if lat, lon, ok := regionCoord(r); ok {
 				if d := haversine(plat, plon, lat, lon); d < best {
 					best = d
 				}
 			}
 		}
-		return best
+		var proximity float64 // 无坐标时距离项为 0（视为最远）
+		if best != math.MaxFloat64 {
+			proximity = clamp01(1 - best/refMaxDist)
+		}
+		return geoWeight*proximity + (1-geoWeight)*(sc.Score/100)
 	}
-	sort.SliceStable(lines, func(i, j int) bool {
-		return dist(lines[i]) < dist(lines[j])
+	sort.SliceStable(scored, func(i, j int) bool {
+		return combined(scored[i]) > combined(scored[j])
 	})
 }
 

@@ -196,3 +196,22 @@ func TestCandidatesForRegionProximityFallback(t *testing.T) {
 		t.Fatalf("河南玩家无同区线路时应就近选山东 sd，实际 %v", got)
 	}
 }
+
+// 综合权衡：最近的线路若延迟极高（评分很低），不应仅凭距离被硬选中。
+// 河南玩家面对「近但极慢的山东(244ms)」与「稍远但很快的北京(27ms)」应选北京。
+func TestCandidatesForRegionProximityRespectsScore(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		// 山东离河南最近，但延迟极高。
+		{Line: config.Line{Name: "sd-slow", Regions: []string{"CN-SD"}}, Reachable: true,
+			AvgLatency: 244 * time.Millisecond, SuccessRate: 1},
+		// 北京稍远，但延迟很低。
+		{Line: config.Line{Name: "bj-fast", Regions: []string{"CN-BJ"}}, Reachable: true,
+			AvgLatency: 27 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForRegion("CN-HA"))
+	if len(got) == 0 || got[0] != "bj-fast" {
+		t.Fatalf("近但极慢的线路不应被硬选，期望首选 bj-fast，实际 %v", got)
+	}
+}
