@@ -154,15 +154,12 @@ func lineDistance(line config.Line, plat, plon float64) float64 {
 // 无可定位 Regions 的线路距离项记 0（视为最远），仅凭健康度参与排序。
 func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
 	scored := s.candidatesScored()
-	combined := func(sc Scored) float64 {
+	sortScoredByKey(scored, func(sc Scored) float64 {
 		var proximity float64
 		if d := lineDistance(sc.Metrics.Line, plat, plon); d != math.MaxFloat64 {
 			proximity = clamp01(1 - d/refMaxDist)
 		}
 		return playerGeoWeight*proximity + (1-playerGeoWeight)*(healthScore(sc.Metrics)/100)
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return combined(scored[i]) > combined(scored[j])
 	})
 	return linesOf(scored)
 }
@@ -183,24 +180,34 @@ func sortByProximity(scored []Scored, playerRegion string) {
 	if !pok {
 		return // 玩家坐标未知，维持评分顺序
 	}
-	combined := func(sc Scored) float64 {
-		best := math.MaxFloat64
-		for _, r := range sc.Metrics.Line.Regions {
-			if lat, lon, ok := regionCoord(r); ok {
-				if d := haversine(plat, plon, lat, lon); d < best {
-					best = d
-				}
-			}
-		}
+	sortScoredByKey(scored, func(sc Scored) float64 {
 		var proximity float64 // 无坐标时距离项为 0（视为最远）
-		if best != math.MaxFloat64 {
-			proximity = clamp01(1 - best/refMaxDist)
+		if d := lineDistance(sc.Metrics.Line, plat, plon); d != math.MaxFloat64 {
+			proximity = clamp01(1 - d/refMaxDist)
 		}
 		return geoWeight*proximity + (1-geoWeight)*(sc.Score/100)
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return combined(scored[i]) > combined(scored[j])
 	})
+}
+
+// sortScoredByKey 按 key 降序稳定排序，每条线路的 key 只计算一次。
+// key 常含 haversine 等较重的距离计算，若直接传给排序比较器会被反复调用；
+// 预先算好各线路的 key 再排序，将距离计算从 O(n log n) 次降到 O(n) 次。
+// 排序对象连同其 key 一起移动，避免比较器索引与已重排的切片脱节。
+func sortScoredByKey(scored []Scored, key func(Scored) float64) {
+	type keyed struct {
+		sc  Scored
+		key float64
+	}
+	items := make([]keyed, len(scored))
+	for i, sc := range scored {
+		items[i] = keyed{sc: sc, key: key(sc)}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].key > items[j].key
+	})
+	for i := range items {
+		scored[i] = items[i].sc
+	}
 }
 
 // regionMatch 判断线路的区域标记是否命中玩家区域。

@@ -15,6 +15,11 @@ import (
 	"nettofrp/internal/selector"
 )
 
+// handshakeTimeout 是登录协商阶段（Proxy Protocol 头 + 握手 + 登录起始 +
+// Login Acknowledged）必须在其内完成的期限。进入 TCP 透传前会清除该读期限，
+// 因此不影响正常游戏长连接，只用于挡住连上不发数据的空转/慢喂连接。
+const handshakeTimeout = 10 * time.Second
+
 // Resolver 将线路解析为可直接连接的 host:port。
 type Resolver interface {
 	Resolve(line config.Line) (string, error)
@@ -79,6 +84,11 @@ func (p *Proxy) handle(client net.Conn) {
 	defer client.Close()
 
 	br := bufio.NewReader(client)
+
+	// 登录协商阶段设读超时：握手/登录起始/Login Acknowledged 都必须在此期限内到齐。
+	// 否则一个连上就不发数据（或逐字节慢喂）的连接会永久占用一个 goroutine，
+	// 在公网入口上构成廉价的资源耗尽面。进入长连接透传前会清除该期限。
+	_ = client.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	// Proxy Protocol V1 头（若启用）位于任何 MC 数据之前，须最先解析。
 	// 取到真实源 IP 用于地理选路；未启用或无合法头时回落 socket 远端地址。
@@ -251,6 +261,9 @@ func (p *Proxy) fallbackTCP(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 		log.Printf("[proxy] 向上游重放握手失败 %s: %v", line.Name, err)
 		return
 	}
+
+	// 透传是长连接，清除协商阶段的读期限，否则游戏进行中会被误判超时断开。
+	_ = client.SetReadDeadline(time.Time{})
 
 	log.Printf("[proxy] %s -> %s(%s) [TCP透传]", client.RemoteAddr(), line.Name, addr)
 	pipeReader(client, br, upstream)
