@@ -116,19 +116,21 @@ func logRanking(sel *selector.Selector) {
 			b.WriteString(m.Line.Name + "=不可达")
 			continue
 		}
-		b.WriteString(formatScore(m.Line.Name, sc.Score, m.AvgLatency, m.SuccessRate))
+		b.WriteString(formatScore(m.Line.Name, sc.Score, m.MinLatency, m.AvgLatency, m.SuccessRate))
 	}
 	log.Println(b.String())
 }
 
-func formatScore(name string, score float64, lat time.Duration, sr float64) string {
+func formatScore(name string, score float64, min, avg time.Duration, sr float64) string {
 	var b strings.Builder
 	b.WriteString(name)
 	b.WriteString("=")
 	b.WriteString(strconv.FormatFloat(score, 'f', 1, 64))
-	b.WriteString("分(")
-	b.WriteString(lat.Round(time.Millisecond).String())
-	b.WriteString(",成功率")
+	b.WriteString("分(min:")
+	b.WriteString(min.Round(time.Millisecond).String())
+	b.WriteString(" avg:")
+	b.WriteString(avg.Round(time.Millisecond).String())
+	b.WriteString(" 成功率:")
 	b.WriteString(strconv.FormatFloat(sr*100, 'f', 0, 64))
 	b.WriteString("%)")
 	return b.String()

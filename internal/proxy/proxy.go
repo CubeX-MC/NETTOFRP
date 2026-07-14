@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"nettofrp/internal/config"
@@ -14,6 +15,9 @@ import (
 	"nettofrp/internal/mcproto"
 	"nettofrp/internal/selector"
 )
+
+// acceptBackoffMax 是 Accept 临时错误的最大退避间隔。
+const acceptBackoffMax = 1 * time.Second
 
 // handshakeTimeout 是登录协商阶段（Proxy Protocol 头 + 握手 + 登录起始 +
 // Login Acknowledged）必须在其内完成的期限。进入 TCP 透传前会清除该读期限，
@@ -70,12 +74,28 @@ func (p *Proxy) Serve() error {
 	}
 	log.Printf("[proxy] auto 入口已监听 %s", p.listenAddr)
 
+	var backoff time.Duration
 	for {
 		client, err := ln.Accept()
 		if err != nil {
-			log.Printf("[proxy] accept 失败: %v", err)
-			continue
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				// 临时错误（如 EMFILE）指数退避
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else {
+					backoff *= 2
+				}
+				if backoff > acceptBackoffMax {
+					backoff = acceptBackoffMax
+				}
+				log.Printf("[proxy] accept 临时错误，%v 后重试: %v", backoff, err)
+				time.Sleep(backoff)
+				continue
+			}
+			// 永久错误或监听器已关闭
+			return err
 		}
+		backoff = 0
 		go p.handle(client)
 	}
 }
@@ -290,20 +310,22 @@ func (p *Proxy) dialCandidates(candidates []config.Line) (net.Conn, config.Line,
 }
 
 // pipeReader 在客户端与上游之间双向转发。客户端方向从 br 读取，
-// 以保留握手之后可能已被缓冲的字节；任一方向结束即收敛。
+// 以保留握手之后可能已被缓冲的字节。
+// 等待两个方向均完成后再返回，防止单方向 EOF 时截断另一方向未传完的响应。
 func pipeReader(client net.Conn, br *bufio.Reader, upstream net.Conn) {
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(client, upstream)
 		closeWrite(client)
-		done <- struct{}{}
 	}()
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(upstream, br)
 		closeWrite(upstream)
-		done <- struct{}{}
 	}()
-	<-done
+	wg.Wait()
 }
 
 // closeWrite 半关闭写方向，通知对端数据发送完毕。

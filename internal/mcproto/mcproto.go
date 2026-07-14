@@ -100,14 +100,29 @@ type Packet struct {
 	Data []byte // 不含长度前缀与包 ID
 }
 
+// maxHandshakeBytes 是握手/登录包允许的最大帧长度。
+// 握手包：协议版本(5) + 地址(255+2) + 端口(2) + 状态(1) ≈ 270 字节，
+// 留出足够余量但远小于通用上限 2 MiB，防止未认证连接大量分配内存。
+const maxHandshakeBytes = 1024
+
 // ReadPacket 读取一个未压缩数据包（长度前缀 + VarInt 包 ID + 负载）。
 // 登录阶段在开启压缩前始终为未压缩格式，NETTOFRP 不会开启压缩。
 func ReadPacket(r *bufio.Reader) (Packet, error) {
+	return readPacket(r, 2097151)
+}
+
+// readHandshakePacket 与 ReadPacket 相同，但对帧长度施加更严格的上限，
+// 防止未认证的握手阶段通过声明大长度来大量分配内存（内存 DoS）。
+func readHandshakePacket(r *bufio.Reader) (Packet, error) {
+	return readPacket(r, maxHandshakeBytes)
+}
+
+func readPacket(r *bufio.Reader, maxLen int32) (Packet, error) {
 	length, err := ReadVarInt(r)
 	if err != nil {
 		return Packet{}, err
 	}
-	if length <= 0 || length > 2097151 {
+	if length <= 0 || length > maxLen {
 		return Packet{}, fmt.Errorf("包长度非法: %d", length)
 	}
 	frame := make([]byte, length)
@@ -120,7 +135,6 @@ func ReadPacket(r *bufio.Reader) (Packet, error) {
 	if err != nil {
 		return Packet{}, err
 	}
-	// 剩余即为负载。
 	data := make([]byte, br.Len())
 	if _, err := io.ReadFull(br, data); err != nil {
 		return Packet{}, err
@@ -154,7 +168,7 @@ type Handshake struct {
 // ReadHandshake 读取并解析握手包（包 ID 0x00）。
 // 同时保留原始字节，便于回落到纯 TCP 转发时向上游重放。
 func ReadHandshake(r *bufio.Reader) (Handshake, error) {
-	pkt, err := ReadPacket(r)
+	pkt, err := readHandshakePacket(r)
 	if err != nil {
 		return Handshake{}, err
 	}
@@ -202,7 +216,7 @@ type LoginStart struct {
 // ReadLoginStart 读取并解析登录起始包（包 ID 0x00，Login 状态）。
 // 协议 ≥759(1.19) 起 UUID 字段存在；本函数仅用于 ≥766 的 Transfer 路径，UUID 恒存在。
 func ReadLoginStart(r *bufio.Reader) (LoginStart, error) {
-	pkt, err := ReadPacket(r)
+	pkt, err := readHandshakePacket(r)
 	if err != nil {
 		return LoginStart{}, err
 	}

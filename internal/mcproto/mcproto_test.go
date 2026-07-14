@@ -22,15 +22,12 @@ func TestVarIntRoundTrip(t *testing.T) {
 }
 
 // Login Success 在 766~767 应追加 Strict Error Handling 字节，768+ 不应追加。
-// 这是版本碎片化最易出错处，必须锁死。
 func TestLoginSuccessStrictErrorHandling(t *testing.T) {
 	var uuid [16]byte
 	name := "Steve"
-
-	// 负载基础长度：16(UUID) + (1 长度前缀 + 5 名字) + 1(属性数=0) = 23。
 	base := 16 + 1 + len(name) + 1
 
-	withByte := BuildLoginSuccess(767, uuid, name) // 1.21.1
+	withByte := BuildLoginSuccess(767, uuid, name)
 	if len(withByte) != base+1 {
 		t.Fatalf("协议 767 应含 Strict Error Handling 字节，长度期望 %d 实际 %d", base+1, len(withByte))
 	}
@@ -38,7 +35,7 @@ func TestLoginSuccessStrictErrorHandling(t *testing.T) {
 		t.Fatalf("Strict Error Handling 应为 0x00，实际 0x%02X", withByte[len(withByte)-1])
 	}
 
-	withoutByte := BuildLoginSuccess(768, uuid, name) // 1.21.2
+	withoutByte := BuildLoginSuccess(768, uuid, name)
 	if len(withoutByte) != base {
 		t.Fatalf("协议 768 不应含 Strict Error Handling 字节，长度期望 %d 实际 %d", base, len(withoutByte))
 	}
@@ -50,7 +47,7 @@ func TestReadHandshake(t *testing.T) {
 	var data []byte
 	data = AppendVarInt(data, 767)
 	data = AppendString(data, "play.example.org")
-	data = append(data, 0x63, 0xDD) // 端口 25565 = 0x63DD
+	data = append(data, 0x63, 0xDD)
 	data = AppendVarInt(data, StateLogin)
 	if err := WritePacket(&buf, 0x00, data); err != nil {
 		t.Fatal(err)
@@ -75,5 +72,29 @@ func TestReadHandshake(t *testing.T) {
 	}
 	if !bytes.Equal(hs.Raw, raw) {
 		t.Fatalf("Raw 未能保留原始帧: 期望 %x 实际 %x", raw, hs.Raw)
+	}
+}
+
+// 超过握手上限（1024字节）的帧应被拒绝，防止内存 DoS。
+func TestReadHandshakeRejectsOversizedFrame(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(AppendVarInt(nil, maxHandshakeBytes+1))
+	buf.Write(make([]byte, maxHandshakeBytes+1))
+
+	_, err := ReadHandshake(bufio.NewReader(&buf))
+	if err == nil {
+		t.Fatal("期望拒绝超大握手帧，但无错误返回")
+	}
+}
+
+// 通用 ReadPacket 仍允许大帧，不受握手限制影响。
+func TestReadPacketAllowsLargeFrame(t *testing.T) {
+	payload := make([]byte, 512)
+	var buf bytes.Buffer
+	if err := WritePacket(&buf, 0x00, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadPacket(bufio.NewReader(&buf)); err != nil {
+		t.Fatalf("ReadPacket 512 字节负载应通过，实际: %v", err)
 	}
 }

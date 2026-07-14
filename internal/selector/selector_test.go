@@ -79,6 +79,65 @@ func TestStabilityAffectsScore(t *testing.T) {
 	}
 }
 
+func TestScoreFallsBackToAverageWhenMinimumMissing(t *testing.T) {
+	got := score([]prober.Metrics{{
+		Line:        config.Line{Name: "line"},
+		Reachable:   true,
+		AvgLatency:  300 * time.Millisecond,
+		SuccessRate: 1,
+	}}, config.Weights{Latency: 1})
+
+	if len(got) != 1 || got[0].Score != 0 {
+		t.Fatalf("缺少最小延迟时应回退到平均延迟，实际评分 %+v", got)
+	}
+}
+
+func TestEMAResetsAfterUnreachableSample(t *testing.T) {
+	s := newSel()
+	line := config.Line{Name: "line"}
+	s.Update([]prober.Metrics{{
+		Line: line, Reachable: true, AvgLatency: 20 * time.Millisecond,
+		MinLatency: 10 * time.Millisecond, SuccessRate: 1,
+	}})
+	s.Update([]prober.Metrics{{Line: line, Reachable: false}})
+	s.Update([]prober.Metrics{{
+		Line: line, Reachable: true, AvgLatency: 200 * time.Millisecond,
+		MinLatency: 150 * time.Millisecond, SuccessRate: 1,
+	}})
+
+	ranking := s.Ranking()
+	if len(ranking) != 1 {
+		t.Fatalf("期望一条排名记录，实际 %+v", ranking)
+	}
+	if got := ranking[0].Metrics.AvgLatency; got != 200*time.Millisecond {
+		t.Fatalf("恢复后的首个样本不应混入故障前历史，期望 200ms，实际 %v", got)
+	}
+	if got := ranking[0].Metrics.MinLatency; got != 150*time.Millisecond {
+		t.Fatalf("恢复后的最小延迟应重新初始化，期望 150ms，实际 %v", got)
+	}
+}
+
+func TestEMASmoothsReachableSamples(t *testing.T) {
+	s := newSel()
+	line := config.Line{Name: "line"}
+	s.Update([]prober.Metrics{{
+		Line: line, Reachable: true, AvgLatency: 100 * time.Millisecond,
+		MinLatency: 50 * time.Millisecond, SuccessRate: 1,
+	}})
+	s.Update([]prober.Metrics{{
+		Line: line, Reachable: true, AvgLatency: 200 * time.Millisecond,
+		MinLatency: 150 * time.Millisecond, SuccessRate: 0.5,
+	}})
+
+	got := s.Ranking()[0].Metrics
+	if got.AvgLatency != 130*time.Millisecond || got.MinLatency != 80*time.Millisecond {
+		t.Fatalf("EMA 延迟结果错误：avg=%v min=%v", got.AvgLatency, got.MinLatency)
+	}
+	if got.SuccessRate < 0.849999 || got.SuccessRate > 0.850001 {
+		t.Fatalf("EMA 成功率结果错误：%v", got.SuccessRate)
+	}
+}
+
 // 候选列表应按评分从高到低排序，供代理按序故障转移。
 func TestCandidatesOrdered(t *testing.T) {
 	s := newSel()

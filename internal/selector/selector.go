@@ -24,29 +24,101 @@ type Scored struct {
 	Score   float64
 }
 
+// emaAlpha 是 EMA 平滑系数。越小越平滑（历史权重越大），越大越跟随最新值。
+// 0.3 表示新数据占 30%，历史占 70%，约需 5~6 轮才能充分响应趋势变化。
+const emaAlpha = 0.3
+
+// healthThreshold 是健康度底线 [0,100]。低于此值的线路被视为"差线路"，
+// 在地理就近排序中降至末尾，不与健康线路竞争距离优势。
+const healthThreshold = 40.0
+
 // Selector 依据探测指标进行综合评分，并维护当前最优线路。
 type Selector struct {
 	weights config.Weights
 
 	mu      sync.RWMutex
 	ranking []Scored
+	ema     map[string]emaState // 线路名 → EMA 历史状态
+}
+
+// emaState 保存各指标的 EMA 历史值。
+type emaState struct {
+	avgLatency  float64 // ns
+	minLatency  float64 // ns
+	jitter      float64 // ns
+	successRate float64
+	bandwidth   float64
+	initialized bool
 }
 
 // New 创建选择器。
 func New(cfg *config.Config) *Selector {
-	return &Selector{weights: cfg.Weights}
+	return &Selector{
+		weights: cfg.Weights,
+		ema:     make(map[string]emaState),
+	}
 }
 
-// Update 传入一轮全部线路的探测结果，重新计算评分与排名。
+// Update 传入一轮全部线路的探测结果，先做 EMA 平滑再重新计算评分与排名。
 func (s *Selector) Update(metrics []prober.Metrics) {
-	ranking := score(metrics, s.weights)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	smoothed := make([]prober.Metrics, len(metrics))
+	for i, m := range metrics {
+		smoothed[i] = s.applyEMA(m)
+	}
+
+	ranking := score(smoothed, s.weights)
 	sort.SliceStable(ranking, func(i, j int) bool {
 		return ranking[i].Score > ranking[j].Score
 	})
-
-	s.mu.Lock()
 	s.ranking = ranking
-	s.mu.Unlock()
+}
+
+// applyEMA 对单条线路的指标做 EMA 平滑，返回平滑后的 Metrics。
+// 必须在持有 s.mu 写锁时调用。
+func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
+	key := m.Line.Name
+	prev, ok := s.ema[key]
+
+	if !m.Reachable {
+		// 故障会打断连续样本，恢复后应从新观测重新初始化。
+		delete(s.ema, key)
+		return m
+	}
+	minLatency := effectiveMinLatency(m)
+	if !ok || !prev.initialized {
+		s.ema[key] = emaState{
+			avgLatency:  float64(m.AvgLatency),
+			minLatency:  float64(minLatency),
+			jitter:      float64(m.Jitter),
+			successRate: m.SuccessRate,
+			bandwidth:   m.Bandwidth,
+			initialized: true,
+		}
+		m.MinLatency = minLatency
+		return m
+	}
+
+	// EMA：new = alpha*current + (1-alpha)*prev
+	next := emaState{
+		avgLatency:  emaAlpha*float64(m.AvgLatency) + (1-emaAlpha)*prev.avgLatency,
+		minLatency:  emaAlpha*float64(minLatency) + (1-emaAlpha)*prev.minLatency,
+		jitter:      emaAlpha*float64(m.Jitter) + (1-emaAlpha)*prev.jitter,
+		successRate: emaAlpha*m.SuccessRate + (1-emaAlpha)*prev.successRate,
+		bandwidth:   emaAlpha*m.Bandwidth + (1-emaAlpha)*prev.bandwidth,
+		initialized: true,
+	}
+	s.ema[key] = next
+
+	out := m
+	out.AvgLatency = time.Duration(next.avgLatency)
+	out.MinLatency = time.Duration(next.minLatency)
+	out.Jitter = time.Duration(next.jitter)
+	out.SuccessRate = next.successRate
+	out.Bandwidth = next.bandwidth
+	return out
 }
 
 // Candidates 返回当前所有可达线路，按评分从高到低排序。
@@ -121,14 +193,13 @@ func linesOf(scored []Scored) []config.Line {
 // Transfer 直连下玩家延迟由「玩家↔线路」的地理距离主导，健康度只作稳定性调节。
 const playerGeoWeight = 0.8
 
-// healthScore 返回线路健康度 [0,100]：只含成功率(0.7) + 抖动(0.3)，
-// 刻意不含 prober 延迟。prober 测的是「NETTOFRP→线路」延迟，而 Transfer 直连下
-// 玩家走的是「玩家→线路」，两者无关；用 prober 延迟给玩家选路会把所有玩家
-// 拉向「离 NETTOFRP 近」的线路，与玩家实际就近无关。
+// healthScore 返回线路健康度 [0,100]：成功率(0.6) + 抖动(0.2) + 延迟(0.2)。
+// 延迟项使用混合延迟，使高延迟线路在健康度判断中也受到惩罚。
 func healthScore(m prober.Metrics) float64 {
 	jitScore := invRef(float64(m.Jitter), float64(refJitter))
-	stab := 0.7*m.SuccessRate + 0.3*jitScore
-	return stab * 100
+	mixedLat := mixedLatency(m)
+	latScore := invRef(mixedLat, float64(refLatency))
+	return (0.6*m.SuccessRate + 0.2*jitScore + 0.2*latScore) * 100
 }
 
 // lineDistance 返回线路到给定坐标的最近距离（公里）。线路可标多个 Regions，
@@ -146,22 +217,37 @@ func lineDistance(line config.Line, plat, plon float64) float64 {
 }
 
 // CandidatesForPlayer 按玩家真实坐标就近 + 线路健康度排序候选。
+// 健康度低于 healthThreshold 的线路被视为"差线路"，直接降至末尾，
+// 不与健康线路竞争距离优势，避免选出又远又差的线路。
 // 综合分 = playerGeoWeight*(1 - 归一化距离) + (1-playerGeoWeight)*(健康度/100)。
-//
-// 这是启用地理选路且成功取到玩家经纬度时的首选路径：直接以玩家实际位置就近选线，
-// 完全不受 prober「NETTOFRP→线路」延迟干扰，从根本上避免所有玩家被拉向同一条
-// 「离中转机近」的线路。健康度仅作次要调节，使又近又不稳的线路不至于硬胜出。
-// 无可定位 Regions 的线路距离项记 0（视为最远），仅凭健康度参与排序。
 func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
 	scored := s.candidatesScored()
-	sortScoredByKey(scored, func(sc Scored) float64 {
+
+	// 按健康度底线分组
+	healthy := make([]Scored, 0, len(scored))
+	unhealthy := make([]Scored, 0)
+	for _, sc := range scored {
+		if healthScore(sc.Metrics) >= healthThreshold {
+			healthy = append(healthy, sc)
+		} else {
+			unhealthy = append(unhealthy, sc)
+		}
+	}
+
+	// 健康线路按就近+健康度排序
+	sortScoredByKey(healthy, func(sc Scored) float64 {
 		var proximity float64
 		if d := lineDistance(sc.Metrics.Line, plat, plon); d != math.MaxFloat64 {
 			proximity = clamp01(1 - d/refMaxDist)
 		}
 		return playerGeoWeight*proximity + (1-playerGeoWeight)*(healthScore(sc.Metrics)/100)
 	})
-	return linesOf(scored)
+	// 差线路内部按健康度排序（成功率高的优先）
+	sortScoredByKey(unhealthy, func(sc Scored) float64 {
+		return healthScore(sc.Metrics)
+	})
+
+	return linesOf(append(healthy, unhealthy...))
 }
 
 // geoWeight 是「地理就近」在兜底综合分中的权重，其余归评分。取 0.5 平衡二者，
@@ -236,6 +322,7 @@ func (s *Selector) Ranking() []Scored {
 }
 
 // score 对一组指标绝对归一化后加权打分。
+// 延迟使用 min*0.4 + avg*0.6 混合值，减少偶发尖峰对评分的影响。
 func score(metrics []prober.Metrics, w config.Weights) []Scored {
 	result := make([]Scored, 0, len(metrics))
 	bwMax := maxBandwidth(metrics)
@@ -246,8 +333,9 @@ func score(metrics []prober.Metrics, w config.Weights) []Scored {
 			continue
 		}
 
-		// 延迟：以 refLatency 为基准线性反向归一化，越低越好。
-		latScore := invRef(float64(m.AvgLatency), float64(refLatency))
+		// 延迟：min*0.4 + avg*0.6 混合，既反映最优情况又不忽略均值。
+		mixedLat := mixedLatency(m)
+		latScore := invRef(mixedLat, float64(refLatency))
 
 		// 稳定性：成功率为主(0.7)，抖动为辅(0.3)。
 		jitScore := invRef(float64(m.Jitter), float64(refJitter))
@@ -268,6 +356,18 @@ func score(metrics []prober.Metrics, w config.Weights) []Scored {
 		result = append(result, Scored{Metrics: m, Score: total * 100})
 	}
 	return result
+}
+
+// effectiveMinLatency 兼容未提供最小延迟的指标，避免把缺失值当作零延迟。
+func effectiveMinLatency(m prober.Metrics) time.Duration {
+	if m.MinLatency <= 0 {
+		return m.AvgLatency
+	}
+	return m.MinLatency
+}
+
+func mixedLatency(m prober.Metrics) float64 {
+	return 0.4*float64(effectiveMinLatency(m)) + 0.6*float64(m.AvgLatency)
 }
 
 // invRef 将 v 相对参考值 ref 线性反向映射到 [0,1]：v=0 得 1，v>=ref 得 0。

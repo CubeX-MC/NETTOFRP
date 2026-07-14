@@ -13,6 +13,7 @@ type Metrics struct {
 	Line        config.Line
 	Reachable   bool
 	AvgLatency  time.Duration // 平均 TCP 建连延迟
+	MinLatency  time.Duration // 最小 TCP 建连延迟
 	Jitter      time.Duration // 延迟抖动（标准差）
 	SuccessRate float64       // 建连成功率 [0,1]
 	Bandwidth   float64       // 估算带宽 (bytes/s)，无法测得时为 0
@@ -72,6 +73,7 @@ func (p *Prober) Probe(line config.Line) Metrics {
 	}
 
 	m.AvgLatency = mean(latencies)
+	m.MinLatency = minDuration(latencies)
 	m.Jitter = stddev(latencies, m.AvgLatency)
 	m.Bandwidth = p.measureBandwidth(addr)
 	return m
@@ -127,4 +129,14 @@ func stddev(ds []time.Duration, avg time.Duration) time.Duration {
 		sq += diff * diff
 	}
 	return time.Duration(math.Sqrt(sq / float64(len(ds))))
+}
+
+func minDuration(ds []time.Duration) time.Duration {
+	m := ds[0]
+	for _, d := range ds[1:] {
+		if d < m {
+			m = d
+		}
+	}
+	return m
 }

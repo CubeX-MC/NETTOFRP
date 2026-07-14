@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"time"
 )
@@ -94,6 +95,7 @@ func (c *Config) validate() error {
 	if len(c.Lines) == 0 {
 		return fmt.Errorf("至少需要配置一条 FRP 线路")
 	}
+	names := make(map[string]bool, len(c.Lines))
 	for i, l := range c.Lines {
 		if l.Name == "" {
 			return fmt.Errorf("第 %d 条线路缺少 name", i+1)
@@ -101,6 +103,32 @@ func (c *Config) validate() error {
 		if l.Address == "" {
 			return fmt.Errorf("线路 %q 缺少 address", l.Name)
 		}
+		if names[l.Name] {
+			return fmt.Errorf("线路名重复: %q", l.Name)
+		}
+		names[l.Name] = true
+	}
+	if err := c.validateWeights(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateWeights() error {
+	w := c.Weights
+	// 全零时 applyDefaults 会填默认值，此处跳过
+	if w.Latency == 0 && w.Stability == 0 && w.Bandwidth == 0 {
+		return nil
+	}
+	for _, v := range [3]float64{w.Latency, w.Stability, w.Bandwidth} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return fmt.Errorf("权重必须为非负有限数（latency=%.3f stability=%.3f bandwidth=%.3f）",
+				w.Latency, w.Stability, w.Bandwidth)
+		}
+	}
+	sum := w.Latency + w.Stability + w.Bandwidth
+	if sum <= 0 {
+		return fmt.Errorf("权重之和必须大于零")
 	}
 	return nil
 }
@@ -121,5 +149,13 @@ func (c *Config) applyDefaults() {
 	w := c.Weights
 	if w.Latency == 0 && w.Stability == 0 && w.Bandwidth == 0 {
 		c.Weights = Weights{Latency: 0.6, Stability: 0.3, Bandwidth: 0.1}
+	} else {
+		// 归一化，确保总和 = 1
+		sum := w.Latency + w.Stability + w.Bandwidth
+		c.Weights = Weights{
+			Latency:   w.Latency / sum,
+			Stability: w.Stability / sum,
+			Bandwidth: w.Bandwidth / sum,
+		}
 	}
 }
