@@ -1,8 +1,8 @@
 // Package mcproto 实现 NETTOFRP 需要的最小 Minecraft Java 版协议子集：
 // 读取握手/登录包、构造 Login Success 与 Transfer 包。
 //
-// 只涉及协议中多年稳定的少数结构（握手、登录起始、登录成功、Transfer），
-// 不触碰任何游戏内封包，因此对客户端版本升级基本免疫。
+// 只涉及握手、登录起始、登录完成与 Transfer 等少数结构，不触碰游戏内封包。
+// 登录完成包仍会随版本变化，所以 Transfer 路径只开放已验证的协议范围。
 package mcproto
 
 import (
@@ -23,9 +23,17 @@ const (
 // Transfer（configuration 状态）在 1.20.5（协议 766）引入。
 const TransferMinProtocol = 766
 
+// TransferMaxProtocol 是当前已验证能够安全模拟登录并下发 Transfer 的
+// 最高协议版本。776 对应 Minecraft 26.2；未来未知协议应回落 TCP 透传。
+const TransferMaxProtocol = 776
+
 // strictErrorHandlingMaxProtocol 是 Login Success 仍带 Strict Error Handling
 // 布尔字段的最高协议版本。766(1.20.5)~767(1.21.1) 需要该字段，768(1.21.2) 起移除。
 const strictErrorHandlingMaxProtocol = 767
+
+// loginSessionIDMinProtocol 是 Login Finished 末尾开始携带 Session UUID 的版本。
+// Minecraft 26.2（协议 776）引入该字段。
+const loginSessionIDMinProtocol = 776
 
 var errVarIntTooBig = errors.New("VarInt 超过 5 字节")
 
@@ -241,15 +249,28 @@ func ReadLoginStart(r *bufio.Reader) (LoginStart, error) {
 	return ls, nil
 }
 
-// BuildLoginSuccess 构造 Login Success 包（Login 状态，包 ID 0x02）的负载。
-// 依据协议版本决定是否追加 Strict Error Handling 布尔字段。
-func BuildLoginSuccess(proto int32, uuid [16]byte, name string) []byte {
+// SupportsTransfer 报告该协议是否在已验证的 Transfer 范围内。
+func SupportsTransfer(proto int32) bool {
+	return proto >= TransferMinProtocol && proto <= TransferMaxProtocol
+}
+
+// NeedsLoginSessionID 报告 Login Finished 是否需要 Session UUID。
+func NeedsLoginSessionID(proto int32) bool {
+	return proto >= loginSessionIDMinProtocol
+}
+
+// BuildLoginSuccess 构造 Login Finished/Login Success 包（Login 状态，包 ID 0x02）负载。
+// sessionID 仅在协议 776+（Minecraft 26.2+）写入。
+func BuildLoginSuccess(proto int32, uuid [16]byte, name string, sessionID [16]byte) []byte {
 	var data []byte
 	data = append(data, uuid[:]...)
 	data = AppendString(data, name)
 	data = AppendVarInt(data, 0) // 属性数量 = 0
 	if proto >= TransferMinProtocol && proto <= strictErrorHandlingMaxProtocol {
 		data = append(data, 0x00) // Strict Error Handling = false
+	}
+	if NeedsLoginSessionID(proto) {
+		data = append(data, sessionID[:]...)
 	}
 	return data
 }

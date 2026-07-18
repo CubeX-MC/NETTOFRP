@@ -38,13 +38,13 @@ type Config struct {
 	Weights       Weights `json:"weights"`
 	Lines         []Line  `json:"lines"`
 
-	// EnableTransfer 为 true 时，对支持 Transfer 的客户端（协议 ≥766，即 1.20.5+）
+	// EnableTransfer 为 true 时，对已验证的客户端（协议 766~776，即 1.20.5~26.2）
 	// 在登录阶段直接下发 Transfer 包，令其直连最优线路，游戏流量不经过本代理。
-	// 低版本客户端或该开关关闭时，回落到纯 TCP 转发。
+	// 低版本、未来未知版本或该开关关闭时，回落到纯 TCP 转发。
 	EnableTransfer bool `json:"enable_transfer"`
 
 	// TransferPacketID 是 configuration 状态下 Transfer 包的 ID。
-	// 1.20.5~1.21.x 为 0x0B(11)。未来版本若包 ID 变动，可在此覆盖而无需改代码。
+	// 1.20.5~26.2 为 0x0B(11)。
 	TransferPacketID int `json:"transfer_packet_id"`
 
 	// EnableProxyProtocol 为 true 时，将每个新连接的首行按 Proxy Protocol V1
@@ -144,7 +144,7 @@ func (c *Config) applyDefaults() {
 		c.ProbeTimeout = 2000
 	}
 	if c.TransferPacketID == 0 {
-		c.TransferPacketID = 0x0B // 1.20.5~1.21.x configuration 状态 Transfer 包 ID
+		c.TransferPacketID = 0x0B // 1.20.5~26.2 configuration 状态 Transfer 包 ID
 	}
 	w := c.Weights
 	if w.Latency == 0 && w.Stability == 0 && w.Bandwidth == 0 {

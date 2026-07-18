@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"crypto/md5"
+	"crypto/rand"
 	"io"
 	"log"
 	"net"
@@ -37,10 +38,10 @@ type RegionLocator interface {
 
 // Proxy 在监听端口上接受玩家连接，作为多条线路统一的 "auto" 入口。
 //
-// 对支持 Transfer 的客户端（协议 ≥766，即 1.20.5+），代理在登录阶段直接下发
+// 对已验证的 Transfer 客户端（协议 766~776，即 1.20.5~26.2），代理在登录阶段下发
 // Transfer 包，令客户端改连最优线路，此后游戏流量不再经过本代理——消除中转延迟。
 // 客户端在被 Transfer 到的线路上完成真正的正版验证（如 limbo）。
-// 低版本客户端、状态查询、或 Transfer 关闭时，回落到纯 TCP 透传。
+// 已验证范围外的客户端、状态查询或 Transfer 关闭时，回落到纯 TCP 透传。
 type Proxy struct {
 	listenAddr       string
 	sel              *selector.Selector
@@ -134,7 +135,7 @@ func (p *Proxy) handle(client net.Conn) {
 	// 其余（状态查询、旧版本客户端、开关关闭）一律回落纯 TCP 透传。
 	eligible := p.enableTransfer &&
 		hs.NextState == mcproto.StateLogin &&
-		hs.ProtocolVersion >= mcproto.TransferMinProtocol
+		mcproto.SupportsTransfer(hs.ProtocolVersion)
 
 	// 优先按玩家真实坐标就近选路（不受 prober→线路 延迟干扰）；
 	// 取不到坐标时降级到按区域标记选路；无地理信息时退化为全局评分。
@@ -196,6 +197,18 @@ func (p *Proxy) tryTransfer(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 		return false // 无可解析线路，交回落处理
 	}
 
+	// 26.2 起 Login Finished 必须携带 Session UUID。在消费 Login Start 前
+	// 先生成，万一系统随机源失败，仍可安全回落 TCP 透传。
+	var sessionID [16]byte
+	if mcproto.NeedsLoginSessionID(hs.ProtocolVersion) {
+		if _, err := rand.Read(sessionID[:]); err != nil {
+			log.Printf("[proxy] 生成 Login Session UUID 失败，回落 TCP 透传: %v", err)
+			return false
+		}
+		sessionID[6] = (sessionID[6] & 0x0f) | 0x40 // UUID version 4
+		sessionID[8] = (sessionID[8] & 0x3f) | 0x80 // RFC 4122 variant
+	}
+
 	// 读取登录起始包，拿到玩家名与 UUID（尚未向客户端回写任何数据）。
 	ls, err := mcproto.ReadLoginStart(br)
 	if err != nil {
@@ -210,7 +223,7 @@ func (p *Proxy) tryTransfer(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 
 	// 离线登录：直接回 Login Success，客户端随后发送 Login Acknowledged 进入
 	// configuration 状态。真正的正版验证由被 Transfer 到的线路（limbo）完成。
-	success := mcproto.BuildLoginSuccess(hs.ProtocolVersion, uuid, ls.Name)
+	success := mcproto.BuildLoginSuccess(hs.ProtocolVersion, uuid, ls.Name, sessionID)
 	if err := mcproto.WritePacket(client, 0x02, success); err != nil {
 		log.Printf("[proxy] 发送 Login Success 失败 %s: %v", client.RemoteAddr(), err)
 		return true

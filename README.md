@@ -23,8 +23,8 @@ Minecraft 服务器 FRP 线路的智能选路入口。将多条独立的 FRP 线
 
 | 方式 | 触发条件 | 效果 |
 |------|----------|------|
-| **Transfer 直连** | 开启 `enable_transfer` 且客户端协议 ≥766（1.20.5+）| 代理下发 Transfer 包令客户端**直连**最优线路，游戏流量不经过代理，**无中转延迟** |
-| **TCP 透传** | 低版本客户端 / 状态查询 / Transfer 关闭 | 代理中转转发，作为兜底，保证任何客户端都可用 |
+| **Transfer 直连** | 开启 `enable_transfer` 且客户端协议在 766~776（1.20.5~26.2）| 代理下发 Transfer 包令客户端**直连**最优线路，游戏流量不经过代理，**无中转延迟** |
+| **TCP 透传** | 已验证范围外的客户端 / 状态查询 / Transfer 关闭 | 代理中转转发，作为兜底，避免未知协议的登录包不兼容 |
 
 Transfer 路径下，NETTOFRP 只做「引路」：以离线方式完成登录握手并把玩家 Transfer 到最优线路，**真正的正版验证由该线路后端（如 limbo + littleskin）完成**。两层是接力关系，不冲突。
 
@@ -76,8 +76,8 @@ cp config.example.json config.json
 | `probe_interval_seconds` | 探测周期 |
 | `probe_samples` | 每轮每条线路的采样次数 |
 | `probe_timeout_ms` | 单次建连超时，同时用作转发建连超时 |
-| `enable_transfer` | 是否对 1.20.5+ 客户端启用 Transfer 直连 |
-| `transfer_packet_id` | configuration 状态 Transfer 包 ID，1.20.5~1.21.x 为 `11`(0x0B)。**未来版本包 ID 若变动，改此处即可，无需改代码** |
+| `enable_transfer` | 是否对已验证的 1.20.5~26.2 客户端启用 Transfer 直连 |
+| `transfer_packet_id` | configuration 状态 Transfer 包 ID，1.20.5~26.2 为 `11`(0x0B) |
 | `enable_proxy_protocol` | 是否解析连接首部的 Proxy Protocol V1 头以获取玩家真实 IP。仅在 NETTOFRP 前置了会发送 PROXY 头的代理（如 frp 开启 `proxy_protocol`、HAProxy）时开启；直连场景保持 `false` |
 | `geoip_db` | MaxMind GeoLite2-City 数据库(.mmdb)路径。非空时启用地理选路：按玩家真实 IP 定位区域，优先选同区线路。为空则不启用 |
 | `weights` | 三项指标权重 |
@@ -146,9 +146,9 @@ ssh root@<服务器> 'pkill -f "nettofrp -config"'
 
 - **DNS 抖动**：SRV 解析临时失败时复用上次成功结果，避免拖慢连接
 - **线路掉线**：按评分顺序故障转移，最优线路连不上自动退到次优
-- **版本兼容**：只解析多年稳定的握手/登录/Transfer 结构，不碰游戏内封包；低版本客户端自动回落 TCP 透传
+- **版本兼容**：不碰游戏内封包；仅在已验证的协议范围内模拟登录并 Transfer，范围外自动回落 TCP 透传
 
 ## 已知限制
 
 - 探测测的是「NETTOFRP 服务器 → 各线路」的质量，不含「玩家 → NETTOFRP」这一段。中转机的网络位置会影响最终体验，建议部署在网络位置较优的机器上。
-- Transfer 直连依赖客户端协议 ≥766（1.20.5+），更早版本走 TCP 透传，中转延迟依旧存在。
+- Transfer 直连当前支持客户端协议 766~776（1.20.5~26.2）。更早或尚未验证的未来版本走 TCP 透传，中转延迟依旧存在，但不会因 NETTOFRP 伪造了过时的登录包而无法连接。

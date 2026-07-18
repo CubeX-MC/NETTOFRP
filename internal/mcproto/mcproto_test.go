@@ -27,7 +27,7 @@ func TestLoginSuccessStrictErrorHandling(t *testing.T) {
 	name := "Steve"
 	base := 16 + 1 + len(name) + 1
 
-	withByte := BuildLoginSuccess(767, uuid, name)
+	withByte := BuildLoginSuccess(767, uuid, name, [16]byte{})
 	if len(withByte) != base+1 {
 		t.Fatalf("协议 767 应含 Strict Error Handling 字节，长度期望 %d 实际 %d", base+1, len(withByte))
 	}
@@ -35,9 +35,41 @@ func TestLoginSuccessStrictErrorHandling(t *testing.T) {
 		t.Fatalf("Strict Error Handling 应为 0x00，实际 0x%02X", withByte[len(withByte)-1])
 	}
 
-	withoutByte := BuildLoginSuccess(768, uuid, name)
+	withoutByte := BuildLoginSuccess(768, uuid, name, [16]byte{})
 	if len(withoutByte) != base {
 		t.Fatalf("协议 768 不应含 Strict Error Handling 字节，长度期望 %d 实际 %d", base, len(withoutByte))
+	}
+}
+
+// Minecraft 26.2（协议 776）的 Login Finished 末尾必须带 Session UUID。
+func TestLoginSuccess26_2IncludesSessionID(t *testing.T) {
+	var profileID [16]byte
+	sessionID := [16]byte{0, 1, 2, 3, 4, 5, 0x46, 7, 0x88, 9, 10, 11, 12, 13, 14, 15}
+	name := "Steve"
+	base := 16 + 1 + len(name) + 1
+
+	data := BuildLoginSuccess(776, profileID, name, sessionID)
+	if len(data) != base+len(sessionID) {
+		t.Fatalf("协议 776 负载长度期望 %d 实际 %d", base+len(sessionID), len(data))
+	}
+	if !bytes.Equal(data[len(data)-len(sessionID):], sessionID[:]) {
+		t.Fatalf("Login Finished 末尾未携带期望的 Session UUID")
+	}
+}
+
+func TestSupportsTransferUsesVerifiedProtocolRange(t *testing.T) {
+	for _, tc := range []struct {
+		proto int32
+		want  bool
+	}{
+		{765, false},
+		{766, true},
+		{776, true},
+		{777, false},
+	} {
+		if got := SupportsTransfer(tc.proto); got != tc.want {
+			t.Errorf("SupportsTransfer(%d) = %t，期望 %t", tc.proto, got, tc.want)
+		}
 	}
 }
 

@@ -156,8 +156,8 @@ func TestProxyTransfer(t *testing.T) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// 协议 767 = 1.21.1，支持 Transfer 且 Login Success 需带 Strict Error Handling。
-	const proto = 767
+	// 协议 776 = 26.2，Login Finished 必须带 Session UUID。
+	const proto = 776
 	writeHandshake(t, conn, proto, "auto.example.org", 25565, mcproto.StateLogin)
 
 	// 登录起始：玩家名 + UUID。
@@ -177,6 +177,14 @@ func TestProxyTransfer(t *testing.T) {
 	}
 	if success.ID != 0x02 {
 		t.Fatalf("期望 Login Success(0x02)，实际 0x%02X", success.ID)
+	}
+	const loginSuccessBaseLen = 16 + 1 + len("Steve") + 1
+	if len(success.Data) != loginSuccessBaseLen+16 {
+		t.Fatalf("协议 776 Login Finished 应带 16 字节 Session UUID，负载长度实际 %d", len(success.Data))
+	}
+	sessionID := success.Data[len(success.Data)-16:]
+	if sessionID[6]>>4 != 4 || sessionID[8]>>6 != 2 {
+		t.Fatalf("Session UUID 不是 RFC 4122 v4: %x", sessionID)
 	}
 
 	// 发送 Login Acknowledged（0x03，无负载）。
