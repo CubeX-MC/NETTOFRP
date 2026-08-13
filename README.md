@@ -32,11 +32,17 @@ Transfer 路径下，NETTOFRP 只做「引路」：以离线方式完成登录�
 
 对每条可达线路按绝对基准归一化后加权（默认权重）：
 
-- **延迟** `0.6`：以 300ms 为基准反向归一化，越低越高分
-- **稳定性** `0.3`：成功率(0.7) + 抖动(0.3)，抖动以 100ms 为基准
-- **带宽** `0.1`：相对本轮最大值归一化；MC 握手阶段通常测不到，此时给中性分 0.5
+- **延迟** `0.65`：以 300ms 为基准反向归一化，越低越高分
+- **稳定性** `0.35`：成功率(0.7) + 抖动(0.3)，抖动以 100ms 为基准
+- **带宽** `0`：保留配置字段以兼容旧文件；当前不通过空连接伪造带宽指标
+
+延迟分采用非线性曲线：`latScore = 1 - (延迟/300ms)^latency_score_exponent`（默认指数 2.0）。指数大于 1 时，低延迟段（如 30ms vs 60ms）的差异被压缩，避免毫秒级差异主导选路抖动；高延迟段（如 150ms vs 200ms）的差异被放大，更重地惩罚烂线路。设为 `1` 即恢复线性评分（旧版行为）。
 
 采用绝对基准而非线路间相对归一化，避免把毫秒级的微小延迟差放大成满分差距，让稳定性权重真正生效。
+
+### 恢复期惩罚
+
+线路故障（连续探测不可达）后重新上线时，不会立刻以全部权重参与竞争。按连续失败轮次乘以惩罚系数（失败 1 次 → 0.9，4 次及以上 → 0.5 封底），此后每个成功探测轮次惩罚衰减一级，直至完全恢复。这防止「掉线-恢复」反复抖动的线路在恢复瞬间把玩家抢走又踢下线，适用于全局评分与地理选路两条路径。
 
 ## 配置
 
@@ -49,18 +55,18 @@ cp config.example.json config.json
 ```json
 {
   "listen": "0.0.0.0:25565",
-  "mc_host": "auto.cubexmc.org",
   "probe_interval_seconds": 15,
   "probe_samples": 5,
   "probe_timeout_ms": 2000,
   "enable_transfer": true,
   "transfer_packet_id": 11,
   "enable_proxy_protocol": false,
+  "proxy_protocol_trusted_cidrs": ["127.0.0.0/8", "::1/128"],
   "geoip_db": "",
   "weights": {
-    "latency": 0.6,
-    "stability": 0.3,
-    "bandwidth": 0.1
+    "latency": 0.65,
+    "stability": 0.35,
+    "bandwidth": 0
   },
   "lines": [
     { "name": "play2", "address": "play2.cubexmc.org:25565", "regions": ["CN-ZJ"] },
@@ -79,7 +85,9 @@ cp config.example.json config.json
 | `enable_transfer` | 是否对已验证的 1.20.5~26.2 客户端启用 Transfer 直连 |
 | `transfer_packet_id` | configuration 状态 Transfer 包 ID，1.20.5~26.2 为 `11`(0x0B) |
 | `enable_proxy_protocol` | 是否解析连接首部的 Proxy Protocol V1 头以获取玩家真实 IP。仅在 NETTOFRP 前置了会发送 PROXY 头的代理（如 frp 开启 `proxy_protocol`、HAProxy）时开启；直连场景保持 `false` |
+| `proxy_protocol_trusted_cidrs` | 允许提供 PROXY 头的前置代理网段。为空时仅信任 `127.0.0.0/8` 和 `::1/128`；远程前置代理必须显式配置 |
 | `geoip_db` | MaxMind GeoLite2-City 数据库(.mmdb)路径。非空时启用地理选路：按玩家真实 IP 定位区域，优先选同区线路。为空则不启用 |
+| `latency_score_exponent` | 延迟评分非线性指数（默认 2.0）。>1 时低延迟段差异压缩、高延迟段惩罚放大；=1 时退化为线性评分 |
 | `weights` | 三项指标权重 |
 | `lines[].srv` | 为 `true` 时 `address` 只填域名，程序查询 `_minecraft._tcp.<域名>` 的 SRV 记录获得真实 host:port |
 | `lines[].regions` | 该线路适合服务的区域标记（如 `["CN-ZJ", "CN-SH"]`）。启用地理选路时，玩家区域命中任一标记的线路优先。标 `"CN"` 命中全国玩家；留空表示通用线路（任何玩家都可回落到它） |
@@ -97,9 +105,9 @@ cp config.example.json config.json
 4. 取不到玩家经纬度时（省份/坐标识别失败）降级为按区域标记选路：`regions` 命中玩家区域的线路整体前移；无同区线路时按「`0.5 × 就近 + 0.5 × 评分`」兜底。
 
 前提与注意：
-- **必须有前置代理发送 PROXY 头**，否则 `enable_proxy_protocol` 拿不到真实 IP，会回落用 socket 远端地址（即前置代理 IP），地理选路无意义。
+- **必须有前置代理发送 PROXY 头**，且其源地址必须位于 `proxy_protocol_trusted_cidrs`；否则不会信任头中的源 IP。
 - GeoLite2-City 库需自行从 MaxMind 下载（免费，需注册），放到服务器上并在 `geoip_db` 指定路径。库文件本地读取，玩家 IP 不外传；日志中的真实 IP 也做脱敏处理（IPv4 仅保留首尾段，如 `39.*.*.27`）。
-- 区域标记用 ISO 码：国家用两位（`CN`、`US`），省/州用 `国家-代码`（`CN-ZJ` 浙江、`CN-GD` 广东、`CN-SH` 上海）。就近排序内置中国大陆各省级行政区的中心坐标；线路的 `regions` 坐标即用于计算它与玩家的距离。
+- 区域标记用 ISO 码：国家用两位（如 `HK`、`JP`），省/州用 `国家-代码`（`CN-ZJ` 浙江、`CN-GD` 广东、`CN-SH` 上海）。就近排序内置中国省级行政区及香港、日本等当前线路区域的中心坐标。
 - 定位失败或未配置 `geoip_db` 时，自动退回全局评分排序，不影响可用性。
 
 ## 构建与运行
@@ -137,7 +145,7 @@ ssh root@<服务器> 'pkill -f "nettofrp -config"'
 | `internal/config` | JSON 配置加载、校验与默认值 |
 | `internal/resolver` | 线路地址解析，SRV 查询 + 缓存 + DNS 抖动时的陈旧结果回退 |
 | `internal/prober` | 多次采样采集延迟、抖动、成功率、带宽 |
-| `internal/selector` | 加权综合评分与候选线路排序，含地理就近 + 评分综合权衡 |
+| `internal/selector` | 加权综合评分与候选线路排序，含非线性延迟评分、恢复期惩罚、地理就近 + 评分综合权衡 |
 | `internal/geoip` | 基于 GeoLite2-City 库将玩家 IP 定位为经纬度坐标（附区域标记，供就近选路）|
 | `internal/mcproto` | 最小 MC 协议子集：握手/登录包读取、Login Success 与 Transfer 包构造 |
 | `internal/proxy` | auto 入口：Proxy Protocol V1 解析 + Transfer 分流 + TCP 透传兜底 + 按评分故障转移 |
@@ -145,10 +153,12 @@ ssh root@<服务器> 'pkill -f "nettofrp -config"'
 ## 容错设计
 
 - **DNS 抖动**：SRV 解析临时失败时复用上次成功结果，避免拖慢连接
-- **线路掉线**：按评分顺序故障转移，最优线路连不上自动退到次优
+- **线路掉线**：按评分顺序故障转移；Transfer 下发前会再做一次 TCP 建连检查（前 3 条候选并行预检，取最快响应者），当前不可达则退到次优
+- **恢复期惩罚**：线路故障后重新上线时，按连续失败次数施加评分惩罚，并在后续成功轮次逐步释放，防止"掉线-恢复"抖动的线路反复翻盘
 - **版本兼容**：不碰游戏内封包；仅在已验证的协议范围内模拟登录并 Transfer，范围外自动回落 TCP 透传
 
 ## 已知限制
 
 - 探测测的是「NETTOFRP 服务器 → 各线路」的质量，不含「玩家 → NETTOFRP」这一段。中转机的网络位置会影响最终体验，建议部署在网络位置较优的机器上。
+- 健康探测默认只验证 TCP 建连，不会伪造玩家登录；因此无法识别 Limbo/Via/登录插件的协议兼容故障。
 - Transfer 直连当前支持客户端协议 766~776（1.20.5~26.2）。更早或尚未验证的未来版本走 TCP 透传，中转延迟依旧存在，但不会因 NETTOFRP 伪造了过时的登录包而无法连接。

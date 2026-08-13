@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"io"
@@ -24,6 +25,9 @@ const acceptBackoffMax = 1 * time.Second
 // Login Acknowledged）必须在其内完成的期限。进入 TCP 透传前会清除该读期限，
 // 因此不影响正常游戏长连接，只用于挡住连上不发数据的空转/慢喂连接。
 const handshakeTimeout = 10 * time.Second
+
+// shutdownGracePeriod 是停止接受新连接后，等待已有连接自然结束的时间。
+const shutdownGracePeriod = 10 * time.Second
 
 // Resolver 将线路解析为可直接连接的 host:port。
 type Resolver interface {
@@ -50,11 +54,19 @@ type Proxy struct {
 	enableTransfer   bool
 	transferPacketID int32
 	enableProxyProto bool
+	trustedProxyNets []*net.IPNet
 	geo              RegionLocator
 }
 
 // New 创建 auto 反向代理。geo 可为 nil，表示不启用地理选路。
 func New(cfg *config.Config, sel *selector.Selector, r Resolver, geo RegionLocator) *Proxy {
+	trustedProxyNets := make([]*net.IPNet, 0, len(cfg.EffectiveProxyProtocolTrustedCIDRs()))
+	for _, cidr := range cfg.EffectiveProxyProtocolTrustedCIDRs() {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			trustedProxyNets = append(trustedProxyNets, network)
+		}
+	}
 	return &Proxy{
 		listenAddr:       cfg.Listen,
 		sel:              sel,
@@ -63,22 +75,44 @@ func New(cfg *config.Config, sel *selector.Selector, r Resolver, geo RegionLocat
 		enableTransfer:   cfg.EnableTransfer,
 		transferPacketID: int32(cfg.TransferPacketID),
 		enableProxyProto: cfg.EnableProxyProtocol,
+		trustedProxyNets: trustedProxyNets,
 		geo:              geo,
 	}
 }
 
-// Serve 启动监听循环，阻塞运行直到监听出错。
-func (p *Proxy) Serve() error {
+// Serve 启动监听循环。ctx 取消后停止接受新连接，并等待已有
+// 连接在宽限期内结束。
+func (p *Proxy) Serve(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
 	ln, err := net.Listen("tcp", p.listenAddr)
 	if err != nil {
 		return err
 	}
 	log.Printf("[proxy] auto 入口已监听 %s", p.listenAddr)
 
+	var handlers sync.WaitGroup
+	var activeMu sync.Mutex
+	active := make(map[net.Conn]struct{})
+	serveDone := make(chan struct{})
+	defer close(serveDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-serveDone:
+		}
+	}()
+
 	var backoff time.Duration
 	for {
 		client, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				waitForHandlers(&handlers, &activeMu, active)
+				return nil
+			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				// 临时错误（如 EMFILE）指数退避
 				if backoff == 0 {
@@ -97,8 +131,45 @@ func (p *Proxy) Serve() error {
 			return err
 		}
 		backoff = 0
-		go p.handle(client)
+		activeMu.Lock()
+		active[client] = struct{}{}
+		activeMu.Unlock()
+		handlers.Add(1)
+		go func() {
+			defer handlers.Done()
+			defer func() {
+				activeMu.Lock()
+				delete(active, client)
+				activeMu.Unlock()
+			}()
+			p.handle(client)
+		}()
 	}
+}
+
+func waitForHandlers(handlers *sync.WaitGroup, activeMu *sync.Mutex, active map[net.Conn]struct{}) {
+	done := make(chan struct{})
+	go func() {
+		handlers.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(shutdownGracePeriod):
+	}
+
+	activeMu.Lock()
+	connections := make([]net.Conn, 0, len(active))
+	for conn := range active {
+		connections = append(connections, conn)
+	}
+	activeMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+	<-done
 }
 
 func (p *Proxy) handle(client net.Conn) {
@@ -161,15 +232,32 @@ func (p *Proxy) handle(client net.Conn) {
 // clientIP 返回玩家真实 IP：启用 Proxy Protocol 且成功解析首行时取其中的源 IP，
 // 否则回落到 socket 连接的远端 IP。
 func (p *Proxy) clientIP(client net.Conn, br *bufio.Reader) net.IP {
-	if p.enableProxyProto {
+	remoteIP := socketIP(client)
+	if p.enableProxyProto && p.isTrustedProxy(remoteIP) {
 		if ip := readProxyProtocolV1(br); ip != nil {
 			return ip
 		}
 	}
+	return remoteIP
+}
+
+func socketIP(client net.Conn) net.IP {
 	if addr, ok := client.RemoteAddr().(*net.TCPAddr); ok {
 		return addr.IP
 	}
 	return nil
+}
+
+func (p *Proxy) isTrustedProxy(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, network := range p.trustedProxyNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // maskIP 对真实 IP 做脱敏，仅用于日志：IPv4 隐去中间两段（39.1.2.27 -> 39.*.*.27），
@@ -191,8 +279,9 @@ func maskIP(ip net.IP) string {
 // 返回 true 表示已接管该连接（无论成功或已写入数据）；返回 false 表示尚未写入
 // 任何数据、可安全回落到 TCP 透传。
 func (p *Proxy) tryTransfer(client net.Conn, br *bufio.Reader, hs mcproto.Handshake, candidates []config.Line) bool {
-	// 选出最优可达线路并解析为客户端可直连的 host:port。
-	line, host, port, ok := p.resolveTarget(candidates)
+	// 选出当前仍可建立 TCP 连接的最优线路，避免把客户端
+	// Transfer 到上一轮探测后刚刚掉线的节点。
+	line, host, port, ok := p.resolveReachableTarget(candidates)
 	if !ok {
 		return false // 无可解析线路，交回落处理
 	}
@@ -252,8 +341,24 @@ func (p *Proxy) tryTransfer(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 	return true
 }
 
-// resolveTarget 从候选线路中选出首个可成功解析的线路，返回其 host 与 port。
-func (p *Proxy) resolveTarget(candidates []config.Line) (config.Line, string, uint16, bool) {
+// maxParallelPrecheck 是 Transfer 下发前并行 TCP 预检的最大候选线路数。
+// 并行预检避免首选线路不可达时串行等待超时，将最坏等待从 N×timeout 降为单个
+// timeout；同时多个候选同时建连，取最快响应者，避免把玩家引去一个慢吞吞的首选。
+const maxParallelPrecheck = 3
+
+// resolveReachableTarget 从候选线路中选出当前可建立 TCP 连接的目标。
+// 前 maxParallelPrecheck 条候选并行预检，取首个成功者（通常也是最快响应者）；
+// 并行批次全部失败时继续按顺序检查剩余候选。全部失败返回 false。
+func (p *Proxy) resolveReachableTarget(candidates []config.Line) (config.Line, string, uint16, bool) {
+	type target struct {
+		line config.Line
+		addr string
+		host string
+		port uint16
+	}
+
+	// 先解析出可拨号的目标（解析失败者直接跳过）。
+	targets := make([]target, 0, len(candidates))
 	for _, line := range candidates {
 		addr, err := p.resolver.Resolve(line)
 		if err != nil {
@@ -270,7 +375,63 @@ func (p *Proxy) resolveTarget(candidates []config.Line) (config.Line, string, ui
 			log.Printf("[proxy] 线路 %s 端口 %q 非法，跳过", line.Name, portStr)
 			continue
 		}
-		return line, host, uint16(port), true
+		targets = append(targets, target{line: line, addr: addr, host: host, port: uint16(port)})
+	}
+	if len(targets) == 0 {
+		return config.Line{}, "", 0, false
+	}
+
+	batch := len(targets)
+	if batch > maxParallelPrecheck {
+		batch = maxParallelPrecheck
+	}
+
+	// 并行预检前 batch 条候选。结果经有缓冲 channel 汇回，所有 goroutine
+	// 各发送一次即退出，即使提前返回也不会泄漏或阻塞。
+	type dialResult struct {
+		tgt target
+		ok  bool
+	}
+	results := make(chan dialResult, batch)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var d net.Dialer
+	d.Timeout = p.dialTO
+	for i := 0; i < batch; i++ {
+		t := targets[i]
+		go func(t target) {
+			conn, err := d.DialContext(ctx, "tcp", t.addr)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[proxy] Transfer 前检查线路 %s(%s) 失败: %v", t.line.Name, t.addr, err)
+				}
+				results <- dialResult{tgt: t, ok: false}
+				return
+			}
+			_ = conn.Close()
+			results <- dialResult{tgt: t, ok: true}
+		}(t)
+	}
+
+	for i := 0; i < batch; i++ {
+		r := <-results
+		if r.ok {
+			cancel() // 取消其余并发预检
+			return r.tgt.line, r.tgt.host, r.tgt.port, true
+		}
+	}
+
+	// 并行批次全部失败：按顺序检查剩余候选（并行预检时未覆盖到的尾部）。
+	for i := batch; i < len(targets); i++ {
+		t := targets[i]
+		conn, err := net.DialTimeout("tcp", t.addr, p.dialTO)
+		if err != nil {
+			log.Printf("[proxy] Transfer 前检查线路 %s(%s) 失败，尝试下一条: %v", t.line.Name, t.addr, err)
+			continue
+		}
+		_ = conn.Close()
+		return t.line, t.host, t.port, true
 	}
 	return config.Line{}, "", 0, false
 }

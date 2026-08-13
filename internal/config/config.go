@@ -1,10 +1,16 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,7 +36,8 @@ type Line struct {
 
 // Config 是程序的完整配置。
 type Config struct {
-	Listen        string  `json:"listen"`
+	Listen string `json:"listen"`
+	// MCHost 仅为兼容旧配置保留，当前不参与握手改写或限制。
 	MCHost        string  `json:"mc_host"`
 	ProbeInterval int     `json:"probe_interval_seconds"`
 	ProbeSamples  int     `json:"probe_samples"`
@@ -53,10 +60,20 @@ type Config struct {
 	// socket 的远端地址。仅在确有前置代理发送 PROXY 头时开启。
 	EnableProxyProtocol bool `json:"enable_proxy_protocol"`
 
+	// ProxyProtocolTrustedCIDRs 限定允许提供 Proxy Protocol 头的前置代理网段。
+	// 为空时仅信任本机回环地址。
+	ProxyProtocolTrustedCIDRs []string `json:"proxy_protocol_trusted_cidrs"`
+
 	// GeoIPDB 是 MaxMind GeoLite2-City 数据库(.mmdb)的路径。非空且文件可加载时，
 	// 启用基于玩家真实 IP 的地理选路：优先选择 Regions 命中玩家所在区域的线路。
 	// 为空则不做地理选路，沿用全局评分排序。
 	GeoIPDB string `json:"geoip_db"`
+
+	// LatencyScoreExponent 是延迟评分的非线性指数（默认 2.0）。
+	// 评分公式：latScore = 1 - (latency/ref)^exp。
+	// exp>1 时低延迟段差异被压缩（避免微小差异主导选路）、高延迟段惩罚被放大；
+	// exp=1 时退化为线性评分（旧版行为）。
+	LatencyScoreExponent float64 `json:"latency_score_exponent"`
 }
 
 // ProbeIntervalDuration 返回探测周期的 time.Duration 形式。
@@ -77,7 +94,15 @@ func Load(path string) (*Config, error) {
 	}
 
 	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("解析配置文件失败: JSON 顶层只能有一个对象")
+		}
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
@@ -92,6 +117,9 @@ func (c *Config) validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen 不能为空")
 	}
+	if err := validateHostPort(c.Listen, true); err != nil {
+		return fmt.Errorf("listen %q 非法: %w", c.Listen, err)
+	}
 	if len(c.Lines) == 0 {
 		return fmt.Errorf("至少需要配置一条 FRP 线路")
 	}
@@ -103,13 +131,77 @@ func (c *Config) validate() error {
 		if l.Address == "" {
 			return fmt.Errorf("线路 %q 缺少 address", l.Name)
 		}
+		if err := validateLineAddress(l); err != nil {
+			return fmt.Errorf("线路 %q: %w", l.Name, err)
+		}
+		for _, region := range l.Regions {
+			if !regionPattern.MatchString(region) {
+				return fmt.Errorf("线路 %q 的区域代码 %q 非法，应如 CN-ZJ、HK 或 JP", l.Name, region)
+			}
+		}
 		if names[l.Name] {
 			return fmt.Errorf("线路名重复: %q", l.Name)
 		}
 		names[l.Name] = true
 	}
+	if c.TransferPacketID < 0 || int64(c.TransferPacketID) > int64(maxVarInt) {
+		return fmt.Errorf("transfer_packet_id 必须在 0~%d 之间", maxVarInt)
+	}
+	for _, cidr := range c.ProxyProtocolTrustedCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("proxy_protocol_trusted_cidrs 中的 %q 非法: %w", cidr, err)
+		}
+	}
 	if err := c.validateWeights(); err != nil {
 		return err
+	}
+	if err := c.validateLatencyExponent(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// EffectiveProxyProtocolTrustedCIDRs 返回 Proxy Protocol 的有效信任网段。
+// 默认只信任本机，避免公网玩家伪造源 IP。
+func (c *Config) EffectiveProxyProtocolTrustedCIDRs() []string {
+	if len(c.ProxyProtocolTrustedCIDRs) > 0 {
+		return append([]string(nil), c.ProxyProtocolTrustedCIDRs...)
+	}
+	return []string{"127.0.0.0/8", "::1/128"}
+}
+
+const maxVarInt = int(^uint32(0) >> 1)
+
+var regionPattern = regexp.MustCompile(`^[A-Z]{2}(?:-[A-Z0-9]{1,3})?$`)
+
+func validateLineAddress(line Line) error {
+	address := strings.TrimSpace(line.Address)
+	if address != line.Address {
+		return fmt.Errorf("address 不能包含首尾空白")
+	}
+	if line.SRV {
+		if strings.ContainsAny(address, ":/ \t\r\n") {
+			return fmt.Errorf("srv=true 时 address 只能填不含端口的域名")
+		}
+		return nil
+	}
+	if err := validateHostPort(address, false); err != nil {
+		return fmt.Errorf("非 SRV 线路 address 必须为 host:port: %w", err)
+	}
+	return nil
+}
+
+func validateHostPort(address string, allowEmptyHost bool) error {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if !allowEmptyHost && host == "" {
+		return fmt.Errorf("host 不能为空")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 {
+		return fmt.Errorf("端口 %q 必须在 1~65535 之间", portText)
 	}
 	return nil
 }
@@ -133,6 +225,19 @@ func (c *Config) validateWeights() error {
 	return nil
 }
 
+// validateLatencyExponent 校验延迟评分指数：0 视为未设置（applyDefaults 填默认值），
+// 其余必须为正的有限数。
+func (c *Config) validateLatencyExponent() error {
+	e := c.LatencyScoreExponent
+	if e == 0 {
+		return nil
+	}
+	if math.IsNaN(e) || math.IsInf(e, 0) || e < 0 {
+		return fmt.Errorf("latency_score_exponent 必须为正的有限数（当前 %.3f）", e)
+	}
+	return nil
+}
+
 func (c *Config) applyDefaults() {
 	if c.ProbeInterval <= 0 {
 		c.ProbeInterval = 15
@@ -146,9 +251,12 @@ func (c *Config) applyDefaults() {
 	if c.TransferPacketID == 0 {
 		c.TransferPacketID = 0x0B // 1.20.5~26.2 configuration 状态 Transfer 包 ID
 	}
+	if c.LatencyScoreExponent <= 0 {
+		c.LatencyScoreExponent = 2.0
+	}
 	w := c.Weights
 	if w.Latency == 0 && w.Stability == 0 && w.Bandwidth == 0 {
-		c.Weights = Weights{Latency: 0.6, Stability: 0.3, Bandwidth: 0.1}
+		c.Weights = Weights{Latency: 0.65, Stability: 0.35, Bandwidth: 0}
 	} else {
 		// 归一化，确保总和 = 1
 		sum := w.Latency + w.Stability + w.Bandwidth

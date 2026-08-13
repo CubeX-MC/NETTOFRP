@@ -16,7 +16,7 @@ type Metrics struct {
 	MinLatency  time.Duration // 最小 TCP 建连延迟
 	Jitter      time.Duration // 延迟抖动（标准差）
 	SuccessRate float64       // 建连成功率 [0,1]
-	Bandwidth   float64       // 估算带宽 (bytes/s)，无法测得时为 0
+	Bandwidth   float64       // 保留字段；当前 TCP 探测不伪造带宽数据，恒为 0
 }
 
 // Resolver 将线路解析为可直接连接的 host:port。
@@ -75,40 +75,7 @@ func (p *Prober) Probe(line config.Line) Metrics {
 	m.AvgLatency = mean(latencies)
 	m.MinLatency = minDuration(latencies)
 	m.Jitter = stddev(latencies, m.AvgLatency)
-	m.Bandwidth = p.measureBandwidth(addr)
 	return m
-}
-
-// measureBandwidth 通过短时读取估算线路吞吐量。
-// 若线路在窗口期内不主动下发数据，返回 0（视为不可测，交由评分层作中性处理）。
-func (p *Prober) measureBandwidth(addr string) float64 {
-	conn, err := net.DialTimeout("tcp", addr, p.timeout)
-	if err != nil {
-		return 0
-	}
-	defer conn.Close()
-
-	window := 300 * time.Millisecond
-	_ = conn.SetReadDeadline(time.Now().Add(window))
-
-	buf := make([]byte, 32*1024)
-	var total int
-	start := time.Now()
-	for {
-		n, err := conn.Read(buf)
-		total += n
-		if err != nil {
-			break
-		}
-		if time.Since(start) >= window {
-			break
-		}
-	}
-	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 || total == 0 {
-		return 0
-	}
-	return float64(total) / elapsed
 }
 
 func mean(ds []time.Duration) time.Duration {

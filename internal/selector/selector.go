@@ -14,8 +14,10 @@ import (
 // 评分参考基准：用于将原始指标绝对归一化到 [0,1]。
 // 采用绝对基准（而非线路间相对值）可避免把极小差异放大到满分区间。
 const (
-	refLatency = 300 * time.Millisecond // 延迟达到此值记 0 分，0 延迟记满分
-	refJitter  = 100 * time.Millisecond // 抖动达到此值记 0 分
+	refLatency            = 300 * time.Millisecond // 延迟达到此值记 0 分，0 延迟记满分
+	refJitter             = 100 * time.Millisecond // 抖动达到此值记 0 分
+	defaultLatencyExponent = 2.0                   // 默认延迟评分非线性指数
+	maxConsecutiveFails   = 5                      // 连续失败计数上限（超过后惩罚封底）
 )
 
 // Scored 是一条线路及其综合评分（0~100，越高越优）。
@@ -34,14 +36,15 @@ const healthThreshold = 40.0
 
 // Selector 依据探测指标进行综合评分，并维护当前最优线路。
 type Selector struct {
-	weights config.Weights
+	weights    config.Weights
+	latencyExp float64
 
 	mu      sync.RWMutex
 	ranking []Scored
 	ema     map[string]emaState // 线路名 → EMA 历史状态
 }
 
-// emaState 保存各指标的 EMA 历史值。
+// emaState 保存各指标的 EMA 历史值及连续失败计数。
 type emaState struct {
 	avgLatency  float64 // ns
 	minLatency  float64 // ns
@@ -49,13 +52,19 @@ type emaState struct {
 	successRate float64
 	bandwidth   float64
 	initialized bool
+	fails       int // 连续不可达轮次（用于恢复期评分惩罚）
 }
 
 // New 创建选择器。
 func New(cfg *config.Config) *Selector {
+	exp := cfg.LatencyScoreExponent
+	if exp <= 0 {
+		exp = defaultLatencyExponent
+	}
 	return &Selector{
-		weights: cfg.Weights,
-		ema:     make(map[string]emaState),
+		weights:    cfg.Weights,
+		latencyExp: exp,
+		ema:        make(map[string]emaState),
 	}
 }
 
@@ -69,7 +78,12 @@ func (s *Selector) Update(metrics []prober.Metrics) {
 		smoothed[i] = s.applyEMA(m)
 	}
 
-	ranking := score(smoothed, s.weights)
+	ranking := score(smoothed, s.weights, s.latencyExp)
+	for i := range ranking {
+		if st, ok := s.ema[ranking[i].Metrics.Line.Name]; ok {
+			ranking[i].Score *= failurePenalty(st.fails)
+		}
+	}
 	sort.SliceStable(ranking, func(i, j int) bool {
 		return ranking[i].Score > ranking[j].Score
 	})
@@ -77,18 +91,35 @@ func (s *Selector) Update(metrics []prober.Metrics) {
 }
 
 // applyEMA 对单条线路的指标做 EMA 平滑，返回平滑后的 Metrics。
+// 不可达时保留历史但记录连续失败计数；恢复后从新观测重新初始化，并施加惩罚。
 // 必须在持有 s.mu 写锁时调用。
 func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 	key := m.Line.Name
 	prev, ok := s.ema[key]
 
 	if !m.Reachable {
-		// 故障会打断连续样本，恢复后应从新观测重新初始化。
-		delete(s.ema, key)
+		// 保留历史（供恢复参考），但初始化标记置 false 使恢复后重新建立 EMA。
+		// 连续失败计数累加，用于恢复期评分惩罚。
+		if ok {
+			prev.fails++
+			if prev.fails > maxConsecutiveFails {
+				prev.fails = maxConsecutiveFails
+			}
+			prev.initialized = false
+		} else {
+			prev = emaState{fails: 1}
+		}
+		s.ema[key] = prev
 		return m
 	}
+
 	minLatency := effectiveMinLatency(m)
+	fails := 0
+	if ok {
+		fails = prev.fails
+	}
 	if !ok || !prev.initialized {
+		// 无历史或刚从故障恢复：从新观测初始化，保留失败计数以施加惩罚。
 		s.ema[key] = emaState{
 			avgLatency:  float64(m.AvgLatency),
 			minLatency:  float64(minLatency),
@@ -96,6 +127,7 @@ func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 			successRate: m.SuccessRate,
 			bandwidth:   m.Bandwidth,
 			initialized: true,
+			fails:       fails,
 		}
 		m.MinLatency = minLatency
 		return m
@@ -109,6 +141,8 @@ func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 		successRate: emaAlpha*m.SuccessRate + (1-emaAlpha)*prev.successRate,
 		bandwidth:   emaAlpha*m.Bandwidth + (1-emaAlpha)*prev.bandwidth,
 		initialized: true,
+		// 恢复观察期：每个成功轮次失败计数递减，惩罚逐步释放
+		fails: decayFails(prev.fails),
 	}
 	s.ema[key] = next
 
@@ -119,6 +153,36 @@ func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 	out.SuccessRate = next.successRate
 	out.Bandwidth = next.bandwidth
 	return out
+}
+
+// failurePenalty 返回连续失败后的恢复期评分惩罚系数 [0.5, 1]。
+// 失败 1 次 → 0.9，4 次及以上 → 0.5 封底。无失败时返回 1（无惩罚）。
+func failurePenalty(fails int) float64 {
+	if fails <= 0 {
+		return 1
+	}
+	if p := 1 - 0.1*float64(fails); p > 0.5 {
+		return p
+	}
+	return 0.5
+}
+
+// decayFails 成功轮次对连续失败计数的衰减：每轮 -1，直至 0。
+func decayFails(fails int) int {
+	if fails <= 0 {
+		return 0
+	}
+	return fails - 1
+}
+
+// Penalty 返回线路当前的恢复期惩罚系数（内部读锁安全）。
+func (s *Selector) Penalty(lineName string) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if st, ok := s.ema[lineName]; ok {
+		return failurePenalty(st.fails)
+	}
+	return 1
 }
 
 // Candidates 返回当前所有可达线路，按评分从高到低排序。
@@ -193,13 +257,12 @@ func linesOf(scored []Scored) []config.Line {
 // Transfer 直连下玩家延迟由「玩家↔线路」的地理距离主导，健康度只作稳定性调节。
 const playerGeoWeight = 0.8
 
-// healthScore 返回线路健康度 [0,100]：成功率(0.6) + 抖动(0.2) + 延迟(0.2)。
-// 延迟项使用混合延迟，使高延迟线路在健康度判断中也受到惩罚。
+// healthScore 返回线路健康度 [0,100]：成功率(0.75) + 抖动(0.25)。
+// Transfer 直连时，NETTOFRP 到线路的延迟不代表玩家到线路的延迟，
+// 因此不将探测延迟混入玩家就近排序的健康度。
 func healthScore(m prober.Metrics) float64 {
 	jitScore := invRef(float64(m.Jitter), float64(refJitter))
-	mixedLat := mixedLatency(m)
-	latScore := invRef(mixedLat, float64(refLatency))
-	return (0.6*m.SuccessRate + 0.2*jitScore + 0.2*latScore) * 100
+	return (0.75*m.SuccessRate + 0.25*jitScore) * 100
 }
 
 // lineDistance 返回线路到给定坐标的最近距离（公里）。线路可标多个 Regions，
@@ -220,14 +283,15 @@ func lineDistance(line config.Line, plat, plon float64) float64 {
 // 健康度低于 healthThreshold 的线路被视为"差线路"，直接降至末尾，
 // 不与健康线路竞争距离优势，避免选出又远又差的线路。
 // 综合分 = playerGeoWeight*(1 - 归一化距离) + (1-playerGeoWeight)*(健康度/100)。
+// 健康度已包含恢复期惩罚，确保刚恢复的线路不会以全部权重参与竞争。
 func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
 	scored := s.candidatesScored()
 
-	// 按健康度底线分组
+	// 按健康度底线分组（健康度已叠加恢复期惩罚）
 	healthy := make([]Scored, 0, len(scored))
 	unhealthy := make([]Scored, 0)
 	for _, sc := range scored {
-		if healthScore(sc.Metrics) >= healthThreshold {
+		if s.healthOf(sc) >= healthThreshold {
 			healthy = append(healthy, sc)
 		} else {
 			unhealthy = append(unhealthy, sc)
@@ -240,14 +304,20 @@ func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
 		if d := lineDistance(sc.Metrics.Line, plat, plon); d != math.MaxFloat64 {
 			proximity = clamp01(1 - d/refMaxDist)
 		}
-		return playerGeoWeight*proximity + (1-playerGeoWeight)*(healthScore(sc.Metrics)/100)
+		return playerGeoWeight*proximity + (1-playerGeoWeight)*(s.healthOf(sc)/100)
 	})
 	// 差线路内部按健康度排序（成功率高的优先）
 	sortScoredByKey(unhealthy, func(sc Scored) float64 {
-		return healthScore(sc.Metrics)
+		return s.healthOf(sc)
 	})
 
 	return linesOf(append(healthy, unhealthy...))
+}
+
+// healthOf 返回线路健康度 [0,100]，叠加恢复期惩罚系数。
+// 连续失败后恢复的线路会获得评分折扣，避免刚恢复就全权重参与竞争。
+func (s *Selector) healthOf(sc Scored) float64 {
+	return healthScore(sc.Metrics) * s.Penalty(sc.Metrics.Line.Name)
 }
 
 // geoWeight 是「地理就近」在兜底综合分中的权重，其余归评分。取 0.5 平衡二者，
@@ -322,8 +392,10 @@ func (s *Selector) Ranking() []Scored {
 }
 
 // score 对一组指标绝对归一化后加权打分。
-// 延迟使用 min*0.4 + avg*0.6 混合值，减少偶发尖峰对评分的影响。
-func score(metrics []prober.Metrics, w config.Weights) []Scored {
+// 延迟使用 min*0.4 + avg*0.6 混合值，并按 latencyExp 指数曲线映射；
+// latencyExp=1 时退化为线性。
+// 采用绝对基准（而非线路间相对值）可避免把极小差异放大到满分区间。
+func score(metrics []prober.Metrics, w config.Weights, latencyExp float64) []Scored {
 	result := make([]Scored, 0, len(metrics))
 	bwMax := maxBandwidth(metrics)
 
@@ -335,27 +407,54 @@ func score(metrics []prober.Metrics, w config.Weights) []Scored {
 
 		// 延迟：min*0.4 + avg*0.6 混合，既反映最优情况又不忽略均值。
 		mixedLat := mixedLatency(m)
-		latScore := invRef(mixedLat, float64(refLatency))
+		latScore := latencyScore(mixedLat, float64(refLatency), latencyExp)
 
 		// 稳定性：成功率为主(0.7)，抖动为辅(0.3)。
 		jitScore := invRef(float64(m.Jitter), float64(refJitter))
 		stabScore := 0.7*m.SuccessRate + 0.3*jitScore
 
-		// 带宽：相对本轮最大值归一化；无法测得(0)时给中性分 0.5。
+		// 带宽：仅在调用方真正提供了带宽数据时参与评分。
 		var bwScore float64
-		switch {
-		case m.Bandwidth <= 0:
-			bwScore = 0.5
-		case bwMax <= 0:
-			bwScore = 0.5
-		default:
-			bwScore = clamp01(m.Bandwidth / bwMax)
+		if bwMax > 0 {
+			if m.Bandwidth <= 0 {
+				bwScore = 0.5
+			} else {
+				bwScore = clamp01(m.Bandwidth / bwMax)
+			}
 		}
 
-		total := w.Latency*latScore + w.Stability*stabScore + w.Bandwidth*bwScore
+		activeWeight := w.Latency + w.Stability
+		total := w.Latency*latScore + w.Stability*stabScore
+		if bwMax > 0 {
+			activeWeight += w.Bandwidth
+			total += w.Bandwidth * bwScore
+		}
+		if activeWeight > 0 {
+			total /= activeWeight
+		} else {
+			total = 0.5
+		}
 		result = append(result, Scored{Metrics: m, Score: total * 100})
 	}
 	return result
+}
+
+// latencyScore 将延迟（ns）相对基准 ref（ns）按指数曲线映射到 [0,1]。
+// 曲线为 1 - (v/ref)^exp。
+// exp>1 时低延迟段差异被压缩（避免无关紧要的毫秒级差异主导选路）、
+// 高延迟段差异被放大（更重地惩罚烂线路）；exp=1 时退化为线性。
+func latencyScore(v, ref, exp float64) float64 {
+	if v < 0 {
+		v = 0
+	}
+	if ref <= 0 {
+		return 0
+	}
+	ratio := v / ref
+	if ratio > 1 {
+		ratio = 1
+	}
+	return 1 - math.Pow(ratio, exp)
 }
 
 // effectiveMinLatency 兼容未提供最小延迟的指标，避免把缺失值当作零延迟。

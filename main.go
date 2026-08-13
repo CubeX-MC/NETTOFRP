@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"log"
-	"os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -33,6 +32,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	if cfg.MCHost != "" {
+		log.Printf("[main] 警告: mc_host 仅为兼容旧配置保留，当前不参与路由，可从配置中删除")
+	}
 
 	res := resolver.New(cfg)
 	pb := prober.New(cfg, res)
@@ -56,8 +58,8 @@ func main() {
 		locator = geo
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// 首轮同步探测，确保代理启动时已有可用的最优线路。
 	runProbe(cfg, pb, sel)
@@ -65,11 +67,10 @@ func main() {
 
 	px := proxy.New(cfg, sel, res, locator)
 
-	go handleSignals(cancel)
-
-	if err := px.Serve(); err != nil {
+	if err := px.Serve(ctx); err != nil {
 		log.Fatalf("代理服务退出: %v", err)
 	}
+	log.Println("代理服务已关闭")
 }
 
 // probeLoop 按配置周期反复探测所有线路并刷新评分。
@@ -134,13 +135,4 @@ func formatScore(name string, score float64, min, avg time.Duration, sr float64)
 	b.WriteString(strconv.FormatFloat(sr*100, 'f', 0, 64))
 	b.WriteString("%)")
 	return b.String()
-}
-
-func handleSignals(cancel context.CancelFunc) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	<-ch
-	log.Println("收到退出信号，正在关闭...")
-	cancel()
-	os.Exit(0)
 }

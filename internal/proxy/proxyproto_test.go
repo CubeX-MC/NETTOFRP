@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 )
@@ -49,5 +50,20 @@ func TestReadProxyProtocolV1Unknown(t *testing.T) {
 	rest, _ := br.Peek(4)
 	if string(rest) != "next" {
 		t.Fatalf("UNKNOWN 头行之后数据应保留，实际 %q", rest)
+	}
+}
+
+func TestTrustedProxyCIDRs(t *testing.T) {
+	_, loopback, _ := net.ParseCIDR("127.0.0.0/8")
+	_, privateNet, _ := net.ParseCIDR("10.20.0.0/16")
+	p := &Proxy{trustedProxyNets: []*net.IPNet{loopback, privateNet}}
+
+	for _, ip := range []string{"127.0.0.1", "10.20.3.4"} {
+		if !p.isTrustedProxy(net.ParseIP(ip)) {
+			t.Fatalf("应信任代理地址 %s", ip)
+		}
+	}
+	if p.isTrustedProxy(net.ParseIP("203.0.113.7")) {
+		t.Fatal("不应信任未配置的公网地址")
 	}
 }

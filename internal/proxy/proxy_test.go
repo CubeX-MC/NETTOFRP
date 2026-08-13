@@ -3,9 +3,11 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -131,13 +133,24 @@ func TestProxyFallbackTCP(t *testing.T) {
 // 支持 Transfer 的客户端（协议 ≥766）应收到 Login Success，
 // 在发送 Login Acknowledged 后收到指向最优线路的 Transfer 包。
 func TestProxyTransfer(t *testing.T) {
+	backAddr, closeBack := startEcho(t)
+	defer closeBack()
+	host, portStr, err := net.SplitHostPort(backAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	cfg := &config.Config{
 		Listen:           "127.0.0.1:0",
 		ProbeTimeout:     1000,
 		EnableTransfer:   true,
 		TransferPacketID: 0x0B,
 		Weights:          config.Weights{Latency: 0.6, Stability: 0.3, Bandwidth: 0.1},
-		Lines:            []config.Line{{Name: "best", Address: "play.example.org:3503"}},
+		Lines:            []config.Line{{Name: "best", Address: backAddr}},
 	}
 
 	sel := selector.New(cfg)
@@ -200,9 +213,64 @@ func TestProxyTransfer(t *testing.T) {
 	if transfer.ID != 0x0B {
 		t.Fatalf("期望 Transfer(0x0B)，实际 0x%02X", transfer.ID)
 	}
-	host, port := parseTransfer(t, transfer.Data)
-	if host != "play.example.org" || port != 3503 {
-		t.Fatalf("Transfer 目标不符: %s:%d", host, port)
+	gotHost, gotPort := parseTransfer(t, transfer.Data)
+	if gotHost != host || gotPort != int32(port) {
+		t.Fatalf("Transfer 目标不符: %s:%d", gotHost, gotPort)
+	}
+}
+
+func TestResolveReachableTargetSkipsDeadCandidate(t *testing.T) {
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := deadListener.Addr().String()
+	_ = deadListener.Close()
+
+	liveAddr, closeLive := startEcho(t)
+	defer closeLive()
+
+	cfg := &config.Config{ProbeTimeout: 200}
+	px := &Proxy{resolver: resolver.New(cfg), dialTO: 200 * time.Millisecond}
+	candidates := []config.Line{
+		{Name: "dead", Address: deadAddr},
+		{Name: "live", Address: liveAddr},
+	}
+
+	line, host, port, ok := px.resolveReachableTarget(candidates)
+	if !ok {
+		t.Fatal("应该选中仍可达的次选线路")
+	}
+	if line.Name != "live" {
+		t.Fatalf("期望跳过掉线首选并选中 live，实际 %q", line.Name)
+	}
+	wantHost, wantPortStr, err := net.SplitHostPort(liveAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPort, _ := strconv.Atoi(wantPortStr)
+	if host != wantHost || port != uint16(wantPort) {
+		t.Fatalf("目标解析不符: %s:%d", host, port)
+	}
+}
+
+func TestServeStopsWhenContextIsCancelled(t *testing.T) {
+	cfg := &config.Config{Listen: "127.0.0.1:0"}
+	px := &Proxy{listenAddr: cfg.Listen}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- px.Serve(ctx)
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve 取消后应正常退出，实际: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve 未在 context 取消后及时退出")
 	}
 }
 

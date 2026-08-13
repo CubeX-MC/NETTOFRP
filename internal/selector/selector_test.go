@@ -85,7 +85,7 @@ func TestScoreFallsBackToAverageWhenMinimumMissing(t *testing.T) {
 		Reachable:   true,
 		AvgLatency:  300 * time.Millisecond,
 		SuccessRate: 1,
-	}}, config.Weights{Latency: 1})
+	}}, config.Weights{Latency: 1}, 2.0)
 
 	if len(got) != 1 || got[0].Score != 0 {
 		t.Fatalf("缺少最小延迟时应回退到平均延迟，实际评分 %+v", got)
@@ -315,5 +315,133 @@ func TestCandidatesForPlayerHealthAdjusts(t *testing.T) {
 	got := names(s.CandidatesForPlayer(39.90, 116.41))
 	if len(got) == 0 || got[0] != "tj-steady" {
 		t.Fatalf("距离几乎相同时，极不稳定线路不应胜出，期望 tj-steady，实际 %v", got)
+	}
+}
+
+func TestCandidatesForPlayerSupportsCountryLevelOverseasLines(t *testing.T) {
+	tests := []struct {
+		name       string
+		playerLat  float64
+		playerLon  float64
+		nearRegion string
+		farRegion  string
+	}{
+		{name: "HongKong", playerLat: 22.32, playerLon: 114.17, nearRegion: "HK", farRegion: "CN-SH"},
+		{name: "Tokyo", playerLat: 35.68, playerLon: 139.76, nearRegion: "JP", farRegion: "CN-SH"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSel()
+			s.Update([]prober.Metrics{
+				{Line: config.Line{Name: "near", Regions: []string{tc.nearRegion}}, Reachable: true,
+					AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+				{Line: config.Line{Name: "far", Regions: []string{tc.farRegion}}, Reachable: true,
+					AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+			})
+
+			got := names(s.CandidatesForPlayer(tc.playerLat, tc.playerLon))
+			if len(got) == 0 || got[0] != "near" {
+				t.Fatalf("玩家应优先命中国家级线路 %s，实际 %v", tc.nearRegion, got)
+			}
+		})
+	}
+}
+
+// 非线性延迟评分：曲线 1-x^exp 在 x∈(0,1) 上始终 ≥ 线性（1-x），
+// 但低延迟段的差异被压缩（两个低延迟线路之间评分差变小），
+// 高延迟段的差异被放大（两个高延迟线路之间评分差变大）。
+func TestLatencyScoreNonlinearBehavior(t *testing.T) {
+	// 低延迟段（50ms vs 100ms）差异应被压缩（非线性差异 < 线性差异）。
+	diffExp2Low := latencyScore(50e6, 300e6, 2.0) - latencyScore(100e6, 300e6, 2.0)
+	diffLinearLow := latencyScore(50e6, 300e6, 1.0) - latencyScore(100e6, 300e6, 1.0)
+	if diffExp2Low >= diffLinearLow {
+		t.Fatalf("低延迟段差异应被压缩（非线性 %.4f < 线性 %.4f）", diffExp2Low, diffLinearLow)
+	}
+	// 高延迟段（200ms vs 250ms）差异应被放大（非线性差异 > 线性差异）。
+	diffExp2High := latencyScore(200e6, 300e6, 2.0) - latencyScore(250e6, 300e6, 2.0)
+	diffLinearHigh := latencyScore(200e6, 300e6, 1.0) - latencyScore(250e6, 300e6, 1.0)
+	if diffExp2High <= diffLinearHigh {
+		t.Fatalf("高延迟段差异应被放大（非线性 %.4f > 线性 %.4f）", diffExp2High, diffLinearHigh)
+	}
+	// 达到基准值（300ms）时两者均为 0。
+	atRef := latencyScore(300e6, 300e6, 2.0)
+	if atRef != 0 {
+		t.Fatalf("300ms 时评分为 0，实际 %.4f", atRef)
+	}
+}
+
+// 恢复期惩罚：连续失败后恢复的线路评分应低于同质量但从未失败的线路。
+func TestRecoveryPenaltyReducesScore(t *testing.T) {
+	s := newSel()
+	lineA := config.Line{Name: "steady", Address: "a"}
+	lineB := config.Line{Name: "recovered", Address: "b"}
+
+	// 两轮：线路 A 一直正常，线路 B 第一次失败、第二次恢复。
+	s.Update([]prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: lineB, Reachable: false},
+	})
+	s.Update([]prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+	})
+
+	ranking := s.Ranking()
+	if len(ranking) != 2 {
+		t.Fatalf("期望两条排名记录，实际 %d", len(ranking))
+	}
+
+	// 线路 B 刚恢复，应受到惩罚，评分低于完全相同的线路 A。
+	if ranking[0].Metrics.Line.Name != "steady" {
+		t.Fatalf("稳定线路应排在首位，实际 %s", ranking[0].Metrics.Line.Name)
+	}
+	if ranking[1].Score >= ranking[0].Score {
+		t.Fatalf("刚恢复的线路评分应低于稳定线路（%.2f vs %.2f）", ranking[1].Score, ranking[0].Score)
+	}
+}
+
+// 恢复期惩罚应逐步衰减：连续成功轮次后，罚分系数应恢复至 1。
+func TestRecoveryPenaltyDecays(t *testing.T) {
+	line := config.Line{Name: "flap", Address: "a"}
+	s := newSel()
+
+	// 一轮失败。
+	s.Update([]prober.Metrics{{Line: line, Reachable: false}})
+	// 恢复后连续成功若干轮，惩罚逐步衰减。
+	for i := 0; i < 6; i++ {
+		s.Update([]prober.Metrics{
+			{Line: line, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		})
+	}
+
+	// 6 轮后的惩罚系数应为 1（无惩罚）。
+	if p := s.Penalty(line.Name); p != 1 {
+		t.Fatalf("6 轮恢复后惩罚系数应为 1，实际 %.2f", p)
+	}
+}
+
+// 健康度叠加惩罚：地理选路中，刚恢复的线路健康度应降低。
+func TestCandidatesForPlayerRespectsRecoveryPenalty(t *testing.T) {
+	s := newSel()
+	lineA := config.Line{Name: "bj-recovered", Regions: []string{"CN-BJ"}}
+	lineB := config.Line{Name: "tj-steady", Regions: []string{"CN-TJ"}}
+
+	// 初始：北京连续 3 轮失败，天津一直正常。
+	for i := 0; i < 3; i++ {
+		s.Update([]prober.Metrics{
+			{Line: lineA, Reachable: false},
+			{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, Jitter: 2 * time.Millisecond, SuccessRate: 1},
+		})
+	}
+	// 恢复后：北京恢复，天津正常。北京离玩家更近，但因受恢复期惩罚仍应排在天津之后。
+	s.Update([]prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, Jitter: 2 * time.Millisecond, SuccessRate: 1},
+		{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, Jitter: 2 * time.Millisecond, SuccessRate: 1},
+	})
+
+	got := names(s.CandidatesForPlayer(39.90, 116.41)) // 北京玩家
+	if len(got) == 0 || got[0] != "tj-steady" {
+		t.Fatalf("刚恢复的北京线路不应因距离近而被选中，期望 tj-steady，实际 %v", got)
 	}
 }
