@@ -3,6 +3,7 @@ package prober
 import (
 	"math"
 	"net"
+	"sort"
 	"time"
 
 	"nettofrp/internal/config"
@@ -10,13 +11,14 @@ import (
 
 // Metrics 保存某条线路一次探测周期采集到的原始网络指标。
 type Metrics struct {
-	Line        config.Line
-	Reachable   bool
-	AvgLatency  time.Duration // 平均 TCP 建连延迟
-	MinLatency  time.Duration // 最小 TCP 建连延迟
-	Jitter      time.Duration // 延迟抖动（标准差）
-	SuccessRate float64       // 建连成功率 [0,1]
-	Bandwidth   float64       // 保留字段；当前 TCP 探测不伪造带宽数据，恒为 0
+	Line          config.Line
+	Reachable     bool
+	AvgLatency    time.Duration // 平均 TCP 建连延迟
+	MinLatency    time.Duration // 最小 TCP 建连延迟
+	MedianLatency time.Duration // 中位 TCP 建连延迟（P50，抗偶发尖峰）
+	Jitter        time.Duration // 延迟抖动（标准差）
+	SuccessRate   float64       // 建连成功率 [0,1]
+	Bandwidth     float64       // 保留字段；当前 TCP 探测不伪造带宽数据，恒为 0
 }
 
 // Resolver 将线路解析为可直接连接的 host:port。
@@ -74,6 +76,7 @@ func (p *Prober) Probe(line config.Line) Metrics {
 
 	m.AvgLatency = mean(latencies)
 	m.MinLatency = minDuration(latencies)
+	m.MedianLatency = medianDuration(latencies)
 	m.Jitter = stddev(latencies, m.AvgLatency)
 	return m
 }
@@ -106,4 +109,20 @@ func minDuration(ds []time.Duration) time.Duration {
 		}
 	}
 	return m
+}
+
+// medianDuration 返回中位延迟（P50）。样本为奇数取中间值，偶数取中间两值平均。
+// 对原始切片做副本排序，不修改输入。
+func medianDuration(ds []time.Duration) time.Duration {
+	n := len(ds)
+	if n == 0 {
+		return 0
+	}
+	sorted := make([]time.Duration, n)
+	copy(sorted, ds)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
 }

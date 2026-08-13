@@ -34,25 +34,32 @@ const emaAlpha = 0.3
 // 在地理就近排序中降至末尾，不与健康线路竞争距离优势。
 const healthThreshold = 40.0
 
+// switchThreshold 是首选线路切换的滞回阈值（评分分差，0~100 制）。
+// 只有当新候选的评分比当前粘性首选高出该分差时才会切换首选，
+// 避免两条评分接近的线路在每轮探测后反复翻转，令玩家被 Transfer 到不同线路。
+const switchThreshold = 2.0
+
 // Selector 依据探测指标进行综合评分，并维护当前最优线路。
 type Selector struct {
 	weights    config.Weights
 	latencyExp float64
 
-	mu      sync.RWMutex
+	mu     sync.RWMutex
 	ranking []Scored
 	ema     map[string]emaState // 线路名 → EMA 历史状态
+	sticky  string              // 粘性首选线路名（滞回抑制频繁翻转）
 }
 
 // emaState 保存各指标的 EMA 历史值及连续失败计数。
 type emaState struct {
-	avgLatency  float64 // ns
-	minLatency  float64 // ns
-	jitter      float64 // ns
-	successRate float64
-	bandwidth   float64
-	initialized bool
-	fails       int // 连续不可达轮次（用于恢复期评分惩罚）
+	avgLatency    float64 // ns
+	minLatency    float64 // ns
+	medianLatency float64 // ns
+	jitter        float64 // ns
+	successRate   float64
+	bandwidth     float64
+	initialized   bool
+	fails         int // 连续不可达轮次（用于恢复期评分惩罚）
 }
 
 // New 创建选择器。
@@ -87,7 +94,64 @@ func (s *Selector) Update(metrics []prober.Metrics) {
 	sort.SliceStable(ranking, func(i, j int) bool {
 		return ranking[i].Score > ranking[j].Score
 	})
+	// 滞回：抑制首选线路在评分接近时反复翻转。
+	ranking, s.sticky = applySticky(ranking, s.sticky)
 	s.ranking = ranking
+}
+
+// applySticky 对已按真实评分降序的排名应用滞回，返回调整后的排名与新粘性首选。
+//
+// 规则：
+//   - 无候选或粘性线路不可达/消失 → 粘性 = 当前首位（自动解除锁定）
+//   - 粘性线路仍是首位 → 保持不动
+//   - 新首位评分 - 粘性线路评分 > switchThreshold → 切换粘性到新首位
+//   - 否则（差距在阈值内）→ 粘性线路前移到首位，抑制翻转
+//
+// 该函数为纯函数，便于单测。
+func applySticky(ranking []Scored, sticky string) ([]Scored, string) {
+	if len(ranking) == 0 {
+		return ranking, ""
+	}
+
+	best := ranking[0]
+	stickyScore, stickyReachable := scoreOfReachable(ranking, sticky)
+
+	// 首次、粘性线路不存在或不可达：直接锁定当前首位。
+	if sticky == "" || !stickyReachable {
+		return ranking, best.Metrics.Line.Name
+	}
+	// 粘性线路已是首位：保持。
+	if best.Metrics.Line.Name == sticky {
+		return ranking, sticky
+	}
+	// 新首位明显超越才切换，否则粘性线路前移。
+	if best.Score-stickyScore > switchThreshold {
+		return ranking, best.Metrics.Line.Name
+	}
+	return moveToFront(ranking, sticky), sticky
+}
+
+// scoreOfReachable 返回指定线路在排名中的评分及是否可达。
+func scoreOfReachable(ranking []Scored, name string) (float64, bool) {
+	for _, sc := range ranking {
+		if sc.Metrics.Line.Name == name {
+			return sc.Score, sc.Metrics.Reachable
+		}
+	}
+	return 0, false
+}
+
+// moveToFront 把指定线路移到切片首位，保持其余线路相对顺序不变。
+// 未找到时原样返回。
+func moveToFront(scored []Scored, name string) []Scored {
+	for i, sc := range scored {
+		if sc.Metrics.Line.Name == name {
+			copy(scored[1:i+1], scored[0:i])
+			scored[0] = sc
+			return scored
+		}
+	}
+	return scored
 }
 
 // applyEMA 对单条线路的指标做 EMA 平滑，返回平滑后的 Metrics。
@@ -118,29 +182,33 @@ func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 	if ok {
 		fails = prev.fails
 	}
+	medLatency := effectiveMedianLatency(m)
 	if !ok || !prev.initialized {
 		// 无历史或刚从故障恢复：从新观测初始化，保留失败计数以施加惩罚。
 		s.ema[key] = emaState{
-			avgLatency:  float64(m.AvgLatency),
-			minLatency:  float64(minLatency),
-			jitter:      float64(m.Jitter),
-			successRate: m.SuccessRate,
-			bandwidth:   m.Bandwidth,
-			initialized: true,
-			fails:       fails,
+			avgLatency:    float64(m.AvgLatency),
+			minLatency:    float64(minLatency),
+			medianLatency: float64(medLatency),
+			jitter:        float64(m.Jitter),
+			successRate:   m.SuccessRate,
+			bandwidth:     m.Bandwidth,
+			initialized:   true,
+			fails:         fails,
 		}
 		m.MinLatency = minLatency
+		m.MedianLatency = medLatency
 		return m
 	}
 
 	// EMA：new = alpha*current + (1-alpha)*prev
 	next := emaState{
-		avgLatency:  emaAlpha*float64(m.AvgLatency) + (1-emaAlpha)*prev.avgLatency,
-		minLatency:  emaAlpha*float64(minLatency) + (1-emaAlpha)*prev.minLatency,
-		jitter:      emaAlpha*float64(m.Jitter) + (1-emaAlpha)*prev.jitter,
-		successRate: emaAlpha*m.SuccessRate + (1-emaAlpha)*prev.successRate,
-		bandwidth:   emaAlpha*m.Bandwidth + (1-emaAlpha)*prev.bandwidth,
-		initialized: true,
+		avgLatency:    emaAlpha*float64(m.AvgLatency) + (1-emaAlpha)*prev.avgLatency,
+		minLatency:    emaAlpha*float64(minLatency) + (1-emaAlpha)*prev.minLatency,
+		medianLatency: emaAlpha*float64(medLatency) + (1-emaAlpha)*prev.medianLatency,
+		jitter:        emaAlpha*float64(m.Jitter) + (1-emaAlpha)*prev.jitter,
+		successRate:   emaAlpha*m.SuccessRate + (1-emaAlpha)*prev.successRate,
+		bandwidth:     emaAlpha*m.Bandwidth + (1-emaAlpha)*prev.bandwidth,
+		initialized:   true,
 		// 恢复观察期：每个成功轮次失败计数递减，惩罚逐步释放
 		fails: decayFails(prev.fails),
 	}
@@ -149,6 +217,7 @@ func (s *Selector) applyEMA(m prober.Metrics) prober.Metrics {
 	out := m
 	out.AvgLatency = time.Duration(next.avgLatency)
 	out.MinLatency = time.Duration(next.minLatency)
+	out.MedianLatency = time.Duration(next.medianLatency)
 	out.Jitter = time.Duration(next.jitter)
 	out.SuccessRate = next.successRate
 	out.Bandwidth = next.bandwidth
@@ -392,7 +461,7 @@ func (s *Selector) Ranking() []Scored {
 }
 
 // score 对一组指标绝对归一化后加权打分。
-// 延迟使用 min*0.4 + avg*0.6 混合值，并按 latencyExp 指数曲线映射；
+// 延迟使用 min*0.4 + median*0.6 混合值，并按 latencyExp 指数曲线映射；
 // latencyExp=1 时退化为线性。
 // 采用绝对基准（而非线路间相对值）可避免把极小差异放大到满分区间。
 func score(metrics []prober.Metrics, w config.Weights, latencyExp float64) []Scored {
@@ -405,7 +474,7 @@ func score(metrics []prober.Metrics, w config.Weights, latencyExp float64) []Sco
 			continue
 		}
 
-		// 延迟：min*0.4 + avg*0.6 混合，既反映最优情况又不忽略均值。
+		// 延迟：min*0.4 + median*0.6 混合，既反映最优能力又抗偶发尖峰。
 		mixedLat := mixedLatency(m)
 		latScore := latencyScore(mixedLat, float64(refLatency), latencyExp)
 
@@ -465,8 +534,19 @@ func effectiveMinLatency(m prober.Metrics) time.Duration {
 	return m.MinLatency
 }
 
+// effectiveMedianLatency 兼容未提供中位延迟的指标，避免把缺失值当作零延迟。
+func effectiveMedianLatency(m prober.Metrics) time.Duration {
+	if m.MedianLatency <= 0 {
+		return m.AvgLatency
+	}
+	return m.MedianLatency
+}
+
+// mixedLatency 返回参与延迟评分的混合延迟：min*0.4 + median*0.6。
+// 用中位数替代均值作为主体，避免偶发尖峰（如一次采样网络拥塞）拉高评分偏差；
+// min 反映线路的最优能力。两者都缺失时回退到 AvgLatency。
 func mixedLatency(m prober.Metrics) float64 {
-	return 0.4*float64(effectiveMinLatency(m)) + 0.6*float64(m.AvgLatency)
+	return 0.4*float64(effectiveMinLatency(m)) + 0.6*float64(effectiveMedianLatency(m))
 }
 
 // invRef 将 v 相对参考值 ref 线性反向映射到 [0,1]：v=0 得 1，v>=ref 得 0。

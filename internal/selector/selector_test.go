@@ -445,3 +445,92 @@ func TestCandidatesForPlayerRespectsRecoveryPenalty(t *testing.T) {
 		t.Fatalf("刚恢复的北京线路不应因距离近而被选中，期望 tj-steady，实际 %v", got)
 	}
 }
+
+// 滞回：评分接近的两条线路不应在每轮探测后反复翻转。
+func TestApplyStickyPreventsFlipping(t *testing.T) {
+	// 线路 a 评分 95，b 评分 96（差 1 < 阈值 2），应保持 a 在首位。
+	ranking := []Scored{
+		{Metrics: prober.Metrics{Line: config.Line{Name: "b"}, Reachable: true}, Score: 96},
+		{Metrics: prober.Metrics{Line: config.Line{Name: "a"}, Reachable: true}, Score: 95},
+	}
+
+	got, sticky := applySticky(ranking, "a")
+	if sticky != "a" {
+		t.Fatalf("滞回应保持粘性线路 a，实际 %q", sticky)
+	}
+	if got[0].Metrics.Line.Name != "a" {
+		t.Fatalf("粘性线路 a 应前移到首位，实际 %q", got[0].Metrics.Line.Name)
+	}
+}
+
+// 滞回：新候选评分明显超越粘性线路时应切换。
+func TestApplyStickySwitchesWhenClearlyBetter(t *testing.T) {
+	// 线路 b 评分 98，a 评分 95（差 3 > 阈值 2），应切换到 b。
+	ranking := []Scored{
+		{Metrics: prober.Metrics{Line: config.Line{Name: "b"}, Reachable: true}, Score: 98},
+		{Metrics: prober.Metrics{Line: config.Line{Name: "a"}, Reachable: true}, Score: 95},
+	}
+
+	got, sticky := applySticky(ranking, "a")
+	if sticky != "b" {
+		t.Fatalf("明显更优的线路 b 应成为新粘性首选，实际 %q", sticky)
+	}
+	if got[0].Metrics.Line.Name != "b" {
+		t.Fatalf("线路 b 应保持在首位，实际 %q", got[0].Metrics.Line.Name)
+	}
+}
+
+// 滞回：粘性线路掉线时应立即解除锁定，切换到次优。
+func TestApplyStickyReleasesWhenDown(t *testing.T) {
+	ranking := []Scored{
+		{Metrics: prober.Metrics{Line: config.Line{Name: "b"}, Reachable: true}, Score: 90},
+		{Metrics: prober.Metrics{Line: config.Line{Name: "a"}, Reachable: false}, Score: 0},
+	}
+
+	got, sticky := applySticky(ranking, "a")
+	if sticky != "b" {
+		t.Fatalf("粘性线路掉线后应切换到 b，实际 %q", sticky)
+	}
+	if got[0].Metrics.Line.Name != "b" {
+		t.Fatalf("线路 b 应为首位，实际 %q", got[0].Metrics.Line.Name)
+	}
+}
+
+// 首次运行（无粘性线路）应直接锁定评分最高者。
+func TestApplyStickyInitial(t *testing.T) {
+	ranking := []Scored{
+		{Metrics: prober.Metrics{Line: config.Line{Name: "a"}, Reachable: true}, Score: 95},
+		{Metrics: prober.Metrics{Line: config.Line{Name: "b"}, Reachable: true}, Score: 90},
+	}
+
+	got, sticky := applySticky(ranking, "")
+	if sticky != "a" {
+		t.Fatalf("首次运行应锁定评分最高者 a，实际 %q", sticky)
+	}
+	if got[0].Metrics.Line.Name != "a" {
+		t.Fatalf("线路 a 应为首位，实际 %q", got[0].Metrics.Line.Name)
+	}
+}
+
+// 中位数延迟应参与评分：median 抗尖峰，令含高延迟尖峰样本的线路得分
+// 高于仅用均值时的结果。
+func TestScoreUsesMedianLatency(t *testing.T) {
+	// 一条线路均值被尖峰拉高（avg=200ms），但中位数稳定（median=50ms, min=40ms）。
+	got := score([]prober.Metrics{{
+		Line:          config.Line{Name: "line"},
+		Reachable:     true,
+		MinLatency:    40 * time.Millisecond,
+		MedianLatency: 50 * time.Millisecond,
+		AvgLatency:    200 * time.Millisecond,
+		SuccessRate:   1,
+	}}, config.Weights{Latency: 1}, 2.0)
+
+	if len(got) != 1 {
+		t.Fatalf("期望一条评分记录，实际 %d", len(got))
+	}
+	// mixed = 0.4*40 + 0.6*50 = 46ms，应远高于仅用 avg(200ms) 的得分。
+	// 46ms → 1-(46/300)^2 ≈ 0.9765，评分约 97.65。
+	if got[0].Score < 90 {
+		t.Fatalf("中位数应显著降低尖峰影响，实际评分 %.2f", got[0].Score)
+	}
+}
