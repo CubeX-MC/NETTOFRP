@@ -74,6 +74,10 @@ type Config struct {
 	// exp>1 时低延迟段差异被压缩（避免微小差异主导选路）、高延迟段惩罚被放大；
 	// exp=1 时退化为线性评分（旧版行为）。
 	LatencyScoreExponent float64 `json:"latency_score_exponent"`
+
+	// StatusListen 是只读状态 HTTP 接口的监听地址（如 "127.0.0.1:8080"）。
+	// 接口返回各线路评分、延迟、成功率与当前首选，便于监控。为空则不启动。
+	StatusListen string `json:"status_listen"`
 }
 
 // ProbeIntervalDuration 返回探测周期的 time.Duration 形式。
@@ -157,6 +161,11 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateLatencyExponent(); err != nil {
 		return err
+	}
+	if c.StatusListen != "" {
+		if err := validateHostPort(c.StatusListen, true); err != nil {
+			return fmt.Errorf("status_listen %q 非法: %w", c.StatusListen, err)
+		}
 	}
 	return nil
 }

@@ -9,6 +9,7 @@
   "proxy_protocol_trusted_cidrs": ["127.0.0.0/8", "::1/128"],
   "geoip_db": "",
   "latency_score_exponent": 2.0,
+  "status_listen": "127.0.0.1:8080",
   "weights": {
     "latency": 0.65,
     "stability": 0.35,

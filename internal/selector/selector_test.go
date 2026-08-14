@@ -534,3 +534,84 @@ func TestScoreUsesMedianLatency(t *testing.T) {
 		t.Fatalf("中位数应显著降低尖峰影响，实际评分 %.2f", got[0].Score)
 	}
 }
+
+// 自适应探测间隔：全部可达且稳定足够轮数时应拉长间隔。
+func TestRecommendedIntervalSlowsWhenStable(t *testing.T) {
+	s := newSel()
+	line := config.Line{Name: "a", Address: "x"}
+	// 连续 5 轮全部可达且首选不变。
+	for i := 0; i < 5; i++ {
+		s.Update([]prober.Metrics{
+			{Line: line, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		})
+	}
+	base := 15 * time.Second
+	if got := s.RecommendedInterval(base); got != base*2 {
+		t.Fatalf("稳定 5 轮后间隔应拉长到 %v，实际 %v", base*2, got)
+	}
+}
+
+// 自适应探测间隔：存在不可达线路时应缩短间隔以便尽快感知恢复。
+func TestRecommendedIntervalSpeedsWhenUnreachable(t *testing.T) {
+	s := newSel()
+	s.Update([]prober.Metrics{
+		{Line: config.Line{Name: "up", Address: "a"}, Reachable: true,
+			AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: config.Line{Name: "down", Address: "b"}, Reachable: false},
+	})
+	base := 15 * time.Second
+	if got := s.RecommendedInterval(base); got != base/3 {
+		t.Fatalf("有不可达线路时间隔应缩短到 %v，实际 %v", base/3, got)
+	}
+}
+
+// 连接数感知：窗口内被频繁选择的线路应获得负载惩罚，从而让位给空闲线路。
+func TestLoadBalancingPenalizesBusyLine(t *testing.T) {
+	s := newSel()
+	lineA := config.Line{Name: "a", Address: "x"}
+	lineB := config.Line{Name: "b", Address: "y"}
+
+	// 两轮都可达且质量完全相同（避免质量差导致排序差异）。
+	metrics := []prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+	}
+	s.Update(metrics)
+
+	// 大量选择线路 a（模拟玩家都涌入 a），少量选择线路 b。
+	for i := 0; i < 10; i++ {
+		s.RecordSelection("a")
+	}
+	s.RecordSelection("b")
+
+	// 再次更新评分：a 因负载惩罚应排在 b 之后。
+	s.Update(metrics)
+	got := names(s.Candidates())
+	if len(got) == 0 || got[0] != "b" {
+		t.Fatalf("高负载线路 a 应让位给空闲线路 b，实际 %v", got)
+	}
+}
+
+// 连接数感知：负载记录在窗口过期后失效，线路恢复正常排序。
+func TestLoadBalancingExpires(t *testing.T) {
+	s := newSel()
+	lineA := config.Line{Name: "a", Address: "x"}
+	lineB := config.Line{Name: "b", Address: "y"}
+
+	metrics := []prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+		{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+	}
+	s.Update(metrics)
+	for i := 0; i < 10; i++ {
+		s.RecordSelection("a")
+	}
+
+	// 窗口过期（loadWindow 后）后 a 不再受惩罚。
+	s.selections = nil // 直接清空，模拟窗口过期清理
+	s.Update(metrics)
+	got := names(s.Candidates())
+	if len(got) == 0 || got[0] != "a" {
+		t.Fatalf("负载记录过期后应恢复原排序，期望 a，实际 %v", got)
+	}
+}

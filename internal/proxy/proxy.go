@@ -338,6 +338,10 @@ func (p *Proxy) tryTransfer(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 
 	log.Printf("[proxy] %s 玩家 %q 协议%d -> Transfer 直连 %s(%s:%d)",
 		client.RemoteAddr(), ls.Name, hs.ProtocolVersion, line.Name, host, port)
+	// 记录本次选择，供连接数感知选路统计负载（sel 可能为 nil 的场景仅测试构造）。
+	if p.sel != nil {
+		p.sel.RecordSelection(line.Name)
+	}
 	return true
 }
 

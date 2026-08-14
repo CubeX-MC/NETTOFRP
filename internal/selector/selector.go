@@ -39,6 +39,23 @@ const healthThreshold = 40.0
 // 避免两条评分接近的线路在每轮探测后反复翻转，令玩家被 Transfer 到不同线路。
 const switchThreshold = 2.0
 
+// 自适应探测间隔阈值：stableRounds 达到该值后认为线路处于稳定期，
+// 建议拉长探测间隔以降低无谓探测；stickyRounds 归零（切换/故障）时建议缩短。
+const (
+	stableRoundsForSlow  = 4 // 首选连续稳定轮数达到该值 → 拉长间隔
+	adaptiveIntervalFast = 3 // 快速探测间隔 = 基准/3
+	adaptiveIntervalSlow = 2 // 慢速探测间隔 = 基准×2
+)
+
+// loadWindow 是连接数感知选路的统计窗口：统计该时间段内各线路被 Transfer
+// 下发的次数。玩家直连线路后流量不再经过代理，代理无法感知真实在线数，
+// 用"近期进入的玩家数"近似负载。
+const loadWindow = 60 * time.Second
+
+// maxLoadPenalty 是负载惩罚的最大幅度：最忙线路评分最多被压低的比例。
+// 取 0.15 时，最忙线路降 15%，既足以分流，又不至于让负载完全压过质量差异。
+const maxLoadPenalty = 0.15
+
 // Selector 依据探测指标进行综合评分，并维护当前最优线路。
 type Selector struct {
 	weights    config.Weights
@@ -48,6 +65,16 @@ type Selector struct {
 	ranking []Scored
 	ema     map[string]emaState // 线路名 → EMA 历史状态
 	sticky  string              // 粘性首选线路名（滞回抑制频繁翻转）
+
+	// stableRounds 统计粘性首选连续未变的轮数，用于自适应探测间隔。
+	// 切换首选、出现故障或恢复期惩罚时归零。
+	stableRounds int
+
+	// 连接数感知选路：loadMu 保护 selections。
+	// selections 记录每条线路在 loadWindow 窗口内被 Transfer 下发的次数，
+	// 用于对高负载线路施加评分惩罚，避免所有玩家涌入同一条线路。
+	loadMu      sync.Mutex
+	selections  map[string][]time.Time
 }
 
 // emaState 保存各指标的 EMA 历史值及连续失败计数。
@@ -72,6 +99,7 @@ func New(cfg *config.Config) *Selector {
 		weights:    cfg.Weights,
 		latencyExp: exp,
 		ema:        make(map[string]emaState),
+		selections: make(map[string][]time.Time),
 	}
 }
 
@@ -91,12 +119,76 @@ func (s *Selector) Update(metrics []prober.Metrics) {
 			ranking[i].Score *= failurePenalty(st.fails)
 		}
 	}
+	// 连接数感知：对窗口内被频繁 Transfer 的线路施加负载惩罚，促进分流。
+	loadFactors := s.computeLoadFactors()
+	for i := range ranking {
+		if f, ok := loadFactors[ranking[i].Metrics.Line.Name]; ok {
+			ranking[i].Score *= f
+		}
+	}
 	sort.SliceStable(ranking, func(i, j int) bool {
 		return ranking[i].Score > ranking[j].Score
 	})
 	// 滞回：抑制首选线路在评分接近时反复翻转。
+	oldSticky := s.sticky
 	ranking, s.sticky = applySticky(ranking, s.sticky)
 	s.ranking = ranking
+	s.updateStableRounds(oldSticky)
+}
+
+// updateStableRounds 更新稳定轮次计数：粘性首选发生真实切换（非首次锁定）、
+// 出现不可达线路或存在恢复期惩罚线路时归零，否则累加。
+// 必须在持有 s.mu 写锁时调用。
+func (s *Selector) updateStableRounds(oldSticky string) {
+	unstable := oldSticky != "" && s.sticky != oldSticky
+	if !unstable {
+		for _, sc := range s.ranking {
+			if !sc.Metrics.Reachable {
+				unstable = true
+				break
+			}
+		}
+	}
+	if !unstable {
+		for _, st := range s.ema {
+			if st.fails > 0 {
+				unstable = true
+				break
+			}
+		}
+	}
+	if unstable {
+		s.stableRounds = 0
+	} else {
+		s.stableRounds++
+	}
+}
+
+// RecommendedInterval 返回下一轮建议的探测间隔：
+//   - 有不可达线路、恢复期惩罚或首选刚切换 → base/3（快速探测，尽快感知恢复与新最优）
+//   - 首选连续稳定 ≥ stableRoundsForSlow 轮 → base×2（降低无谓探测）
+//   - 其余 → base
+func (s *Selector) RecommendedInterval(base time.Duration) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, sc := range s.ranking {
+		if !sc.Metrics.Reachable {
+			return base / adaptiveIntervalFast
+		}
+	}
+	for _, st := range s.ema {
+		if st.fails > 0 {
+			return base / adaptiveIntervalFast
+		}
+	}
+	if s.stableRounds == 0 {
+		return base / adaptiveIntervalFast
+	}
+	if s.stableRounds >= stableRoundsForSlow {
+		return base * adaptiveIntervalSlow
+	}
+	return base
 }
 
 // applySticky 对已按真实评分降序的排名应用滞回，返回调整后的排名与新粘性首选。
@@ -254,6 +346,98 @@ func (s *Selector) Penalty(lineName string) float64 {
 	return 1
 }
 
+// RecordSelection 记录一次将玩家 Transfer 到某条线路的选择事件。
+// 由代理在成功下发 Transfer 包后调用，用于连接数感知的负载统计。
+func (s *Selector) RecordSelection(lineName string) {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	now := time.Now()
+	s.selections[lineName] = append(s.selections[lineName], now)
+	s.pruneSelections(now)
+}
+
+// pruneSelections 清理窗口外的选择记录。必须在持有 loadMu 时调用。
+func (s *Selector) pruneSelections(now time.Time) {
+	cutoff := now.Add(-loadWindow)
+	for name, ts := range s.selections {
+		n := 0
+		for _, t := range ts {
+			if t.After(cutoff) {
+				ts[n] = t
+				n++
+			}
+		}
+		if n == 0 {
+			delete(s.selections, name)
+		} else {
+			s.selections[name] = ts[:n]
+		}
+	}
+}
+
+// computeLoadFactors 计算各线路的负载惩罚系数 map[lineName]factor。
+// 惩罚是相对的：窗口内选择次数最多的线路 factor = 1-maxLoadPenalty（最重），
+// 最少的线路 factor = 1（无惩罚），其余线性过渡。全部相同或无记录时均返回 1，
+// 避免「所有线路都有玩家」时整体降分。
+func (s *Selector) computeLoadFactors() map[string]float64 {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	s.pruneSelections(time.Now())
+
+	if len(s.selections) == 0 {
+		return nil
+	}
+	min, max := int(^uint(0)>>1), 0
+	for _, ts := range s.selections {
+		c := len(ts)
+		if c < min {
+			min = c
+		}
+		if c > max {
+			max = c
+		}
+	}
+	if max == min {
+		return nil // 所有线路负载相同，不施加惩罚
+	}
+
+	factors := make(map[string]float64, len(s.selections))
+	span := float64(max - min)
+	for name, ts := range s.selections {
+		ratio := float64(len(ts)-min) / span // [0,1]，越大越忙
+		factors[name] = 1 - maxLoadPenalty*ratio
+	}
+	return factors
+}
+
+// loadFactor 返回单条线路的负载惩罚系数（读锁安全）。无记录或负载与
+// 其他线路无差异时返回 1。公式与 computeLoadFactors 一致：按相对最忙比例线性惩罚。
+func (s *Selector) loadFactor(lineName string) float64 {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	s.pruneSelections(time.Now())
+
+	ts, ok := s.selections[lineName]
+	if !ok || len(ts) == 0 || len(s.selections) < 2 {
+		return 1
+	}
+	min, max := int(^uint(0)>>1), 0
+	for _, other := range s.selections {
+		c := len(other)
+		if c < min {
+			min = c
+		}
+		if c > max {
+			max = c
+		}
+	}
+	if max == min {
+		return 1
+	}
+	ratio := float64(len(ts)-min) / float64(max-min)
+	return 1 - maxLoadPenalty*ratio
+}
+
 // Candidates 返回当前所有可达线路，按评分从高到低排序。
 // 供代理按序故障转移：最优线路连不上时可退到次优，避免拒绝玩家。
 func (s *Selector) Candidates() []config.Line {
@@ -383,10 +567,13 @@ func (s *Selector) CandidatesForPlayer(plat, plon float64) []config.Line {
 	return linesOf(append(healthy, unhealthy...))
 }
 
-// healthOf 返回线路健康度 [0,100]，叠加恢复期惩罚系数。
-// 连续失败后恢复的线路会获得评分折扣，避免刚恢复就全权重参与竞争。
+// healthOf 返回线路健康度 [0,100]，叠加恢复期惩罚与负载惩罚系数。
+// 连续失败后恢复的线路会获得评分折扣；窗口内被频繁选中的线路同样降权，
+// 促使地理选路也向空闲线路分流。
 func (s *Selector) healthOf(sc Scored) float64 {
-	return healthScore(sc.Metrics) * s.Penalty(sc.Metrics.Line.Name)
+	return healthScore(sc.Metrics) *
+		s.Penalty(sc.Metrics.Line.Name) *
+		s.loadFactor(sc.Metrics.Line.Name)
 }
 
 // geoWeight 是「地理就近」在兜底综合分中的权重，其余归评分。取 0.5 平衡二者，
@@ -458,6 +645,20 @@ func (s *Selector) Ranking() []Scored {
 	out := make([]Scored, len(s.ranking))
 	copy(out, s.ranking)
 	return out
+}
+
+// Sticky 返回当前粘性首选线路名（供状态接口展示）。
+func (s *Selector) Sticky() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sticky
+}
+
+// StableRounds 返回粘性首选连续稳定轮数（供状态接口展示）。
+func (s *Selector) StableRounds() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stableRounds
 }
 
 // score 对一组指标绝对归一化后加权打分。
