@@ -463,22 +463,89 @@ func (p *Proxy) fallbackTCP(client net.Conn, br *bufio.Reader, hs mcproto.Handsh
 	pipeReader(client, br, upstream)
 }
 
-// dialCandidates 按顺序尝试连接候选线路，返回首个成功的连接及其线路信息。
-// 全部失败时返回 nil。
+// dialCandidates 并行尝试连接前 maxParallelPrecheck 条候选线路，返回首个成功的连接
+// 及其线路信息（连接保持打开，供透传转发）。其余成功建立的连接会被关闭。
+// 并行批次全部失败时按顺序尝试剩余候选。全部失败返回 nil。
 func (p *Proxy) dialCandidates(candidates []config.Line) (net.Conn, config.Line, string) {
+	type target struct {
+		line config.Line
+		addr string
+	}
+
+	// 先解析出可拨号的目标（解析失败者直接跳过）。
+	targets := make([]target, 0, len(candidates))
 	for _, line := range candidates {
 		addr, err := p.resolver.Resolve(line)
 		if err != nil {
 			log.Printf("[proxy] 解析线路 %s(%s) 失败，跳过: %v", line.Name, line.Address, err)
 			continue
 		}
+		targets = append(targets, target{line: line, addr: addr})
+	}
+	if len(targets) == 0 {
+		return nil, config.Line{}, ""
+	}
 
-		upstream, err := net.DialTimeout("tcp", addr, p.dialTO)
+	batch := len(targets)
+	if batch > maxParallelPrecheck {
+		batch = maxParallelPrecheck
+	}
+
+	// 并行拨号前 batch 条候选。结果经有缓冲 channel 汇回，所有 goroutine
+	// 各发送一次即退出，即使提前返回也不会泄漏或阻塞。
+	type dialResult struct {
+		tgt  target
+		conn net.Conn
+	}
+	results := make(chan dialResult, batch)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var d net.Dialer
+	d.Timeout = p.dialTO
+	for i := 0; i < batch; i++ {
+		t := targets[i]
+		go func(t target) {
+			conn, err := d.DialContext(ctx, "tcp", t.addr)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[proxy] 连接线路 %s(%s) 失败: %v", t.line.Name, t.addr, err)
+				}
+				results <- dialResult{tgt: t, conn: nil}
+				return
+			}
+			results <- dialResult{tgt: t, conn: conn}
+		}(t)
+	}
+
+	// 取首个成功者作为转发连接，关闭其余落败但已建立的连接。
+	var winner dialResult
+	found := false
+	for i := 0; i < batch; i++ {
+		r := <-results
+		if r.conn != nil {
+			if !found {
+				winner = r
+				found = true
+				cancel() // 取消其余并发拨号
+			} else {
+				_ = r.conn.Close()
+			}
+		}
+	}
+	if found {
+		return winner.conn, winner.tgt.line, winner.tgt.addr
+	}
+
+	// 并行批次全部失败：按顺序尝试剩余候选（并行批次未覆盖到的尾部）。
+	for i := batch; i < len(targets); i++ {
+		t := targets[i]
+		upstream, err := net.DialTimeout("tcp", t.addr, p.dialTO)
 		if err != nil {
-			log.Printf("[proxy] 连接线路 %s(%s) 失败，尝试下一条: %v", line.Name, addr, err)
+			log.Printf("[proxy] 连接线路 %s(%s) 失败，尝试下一条: %v", t.line.Name, t.addr, err)
 			continue
 		}
-		return upstream, line, addr
+		return upstream, t.line, t.addr
 	}
 	return nil, config.Line{}, ""
 }

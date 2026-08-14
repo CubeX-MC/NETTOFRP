@@ -4,6 +4,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"sync"
 	"time"
 
 	"nettofrp/internal/config"
@@ -43,6 +44,8 @@ func New(cfg *config.Config, r Resolver) *Prober {
 }
 
 // Probe 对一条线路进行多次采样，返回聚合后的指标。
+// 采样并行发出：整轮探测最坏耗时从 N×timeout（串行超时累加）降为单个 timeout，
+// 对不可达线路尤为关键——否则一条死线路会让整个探测循环阻塞数秒。
 func (p *Prober) Probe(line config.Line) Metrics {
 	addr, err := p.resolver.Resolve(line)
 	if err != nil {
@@ -50,19 +53,37 @@ func (p *Prober) Probe(line config.Line) Metrics {
 		return Metrics{Line: line, Reachable: false}
 	}
 
+	type sample struct {
+		latency time.Duration
+		ok      bool
+	}
+	results := make(chan sample, p.samples)
+	var wg sync.WaitGroup
+	for i := 0; i < p.samples; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			conn, err := net.DialTimeout("tcp", addr, p.timeout)
+			if err != nil {
+				results <- sample{ok: false}
+				return
+			}
+			latency := time.Since(start)
+			_ = conn.Close()
+			results <- sample{latency: latency, ok: true}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
 	latencies := make([]time.Duration, 0, p.samples)
 	var success int
-
-	for i := 0; i < p.samples; i++ {
-		start := time.Now()
-		conn, err := net.DialTimeout("tcp", addr, p.timeout)
-		if err != nil {
-			continue
+	for s := range results {
+		if s.ok {
+			latencies = append(latencies, s.latency)
+			success++
 		}
-		latency := time.Since(start)
-		latencies = append(latencies, latency)
-		success++
-		_ = conn.Close()
 	}
 
 	m := Metrics{
