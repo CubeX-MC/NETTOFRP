@@ -16,8 +16,8 @@
     "bandwidth": 0
   },
   "lines": [
-    { "name": "play1", "address": "play1.example.org:25565", "regions": ["CN-ZJ", "CN-SH"] },
-    { "name": "play2", "address": "play2.example.org:25565", "regions": ["CN-GD"] },
+    { "name": "play1", "address": "play1.example.org:25565", "regions": ["CN-ZJ", "CN-SH"], "max_load": 100 },
+    { "name": "play2", "address": "play2.example.org:25565", "regions": ["CN-GD"], "max_load": 50 },
     { "name": "play-srv", "address": "play.example.org", "srv": true, "regions": ["CN"] }
   ]
 }

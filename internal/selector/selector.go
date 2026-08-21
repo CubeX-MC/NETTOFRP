@@ -47,13 +47,14 @@ const (
 	adaptiveIntervalSlow = 2 // 慢速探测间隔 = 基准×2
 )
 
-// loadWindow 是连接数感知选路的统计窗口：统计该时间段内各线路被 Transfer
-// 下发的次数。玩家直连线路后流量不再经过代理，代理无法感知真实在线数，
-// 用"近期进入的玩家数"近似负载。
-const loadWindow = 60 * time.Second
+// loadHalfLife 是负载计数器的衰减半衰期，用于估算"当前在线玩家数"。
+// 每次 Transfer 下发使计数器 +1，之后按指数衰减。30 分钟半衰期下，
+// 一个玩家被 Transfer 30 分钟后计为 0.5 人，60 分钟后 0.25 人，
+// 反映典型 MC 游戏会话时长，以此估计各线路的实时在线人数。
+const loadHalfLife = 30 * time.Minute
 
-// maxLoadPenalty 是负载惩罚的最大幅度：最忙线路评分最多被压低的比例。
-// 取 0.15 时，最忙线路降 15%，既足以分流，又不至于让负载完全压过质量差异。
+// maxLoadPenalty 是负载惩罚的最大幅度：线路已满（count≥max_load）时最多降 15%。
+// 取 0.15 时能有效分流，又不至于让负载完全压过延迟/稳定性差异。
 const maxLoadPenalty = 0.15
 
 // Selector 依据探测指标进行综合评分，并维护当前最优线路。
@@ -70,11 +71,18 @@ type Selector struct {
 	// 切换首选、出现故障或恢复期惩罚时归零。
 	stableRounds int
 
-	// 连接数感知选路：loadMu 保护 selections。
-	// selections 记录每条线路在 loadWindow 窗口内被 Transfer 下发的次数，
-	// 用于对高负载线路施加评分惩罚，避免所有玩家涌入同一条线路。
-	loadMu      sync.Mutex
-	selections  map[string][]time.Time
+	// 负载均衡：loadMu 保护 loadStates 与 loadMaxCapacity。
+	// loadStates 记录各线路的衰减在线计数器（每次 Transfer +1，按 loadHalfLife 衰减）。
+	// loadMaxCapacity 从配置中读取，0 表示不限容量。
+	loadMu           sync.Mutex
+	loadStates       map[string]loadState
+	loadMaxCapacity  map[string]int
+}
+
+// loadState 是某条线路的负载衰减计数器状态。
+type loadState struct {
+	count    float64   // 当前估算在线人数（衰减后）
+	lastTime time.Time // 上次更新/衰减时间
 }
 
 // emaState 保存各指标的 EMA 历史值及连续失败计数。
@@ -99,7 +107,16 @@ func New(cfg *config.Config) *Selector {
 		weights:    cfg.Weights,
 		latencyExp: exp,
 		ema:        make(map[string]emaState),
-		selections: make(map[string][]time.Time),
+		loadStates: make(map[string]loadState),
+		loadMaxCapacity: func() map[string]int {
+			m := make(map[string]int, len(cfg.Lines))
+			for _, l := range cfg.Lines {
+				if l.MaxLoad > 0 {
+					m[l.Name] = l.MaxLoad
+				}
+			}
+			return m
+		}(),
 	}
 }
 
@@ -347,94 +364,89 @@ func (s *Selector) Penalty(lineName string) float64 {
 }
 
 // RecordSelection 记录一次将玩家 Transfer 到某条线路的选择事件。
-// 由代理在成功下发 Transfer 包后调用，用于连接数感知的负载统计。
+// 衰减计数器 +1，用于按容量比例估算实时负载，引导新玩家分流到更空闲的线路。
 func (s *Selector) RecordSelection(lineName string) {
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
-	now := time.Now()
-	s.selections[lineName] = append(s.selections[lineName], now)
-	s.pruneSelections(now)
+	s.decayLoad(lineName)
+	st := s.loadStates[lineName]
+	st.count += 1
+	st.lastTime = time.Now()
+	s.loadStates[lineName] = st
 }
 
-// pruneSelections 清理窗口外的选择记录。必须在持有 loadMu 时调用。
-func (s *Selector) pruneSelections(now time.Time) {
-	cutoff := now.Add(-loadWindow)
-	for name, ts := range s.selections {
-		n := 0
-		for _, t := range ts {
-			if t.After(cutoff) {
-				ts[n] = t
-				n++
-			}
-		}
-		if n == 0 {
-			delete(s.selections, name)
-		} else {
-			s.selections[name] = ts[:n]
-		}
+// decayLoad 对指定线路的衰减计数器按经过时间指数衰减。
+// 每经过一个 loadHalfLife，计数减半，模拟玩家陆续下线。
+// 必须在持有 loadMu 时调用。
+func (s *Selector) decayLoad(lineName string) {
+	st, ok := s.loadStates[lineName]
+	if !ok {
+		st.lastTime = time.Now()
+		s.loadStates[lineName] = st
+		return
 	}
+	elapsed := time.Since(st.lastTime).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	// 指数衰减：count *= 2^(-elapsed / halfLifeSeconds)
+	hl := loadHalfLife.Seconds()
+	st.count *= math.Pow(0.5, elapsed/hl)
+	if st.count < 0.01 {
+		st.count = 0
+	}
+	st.lastTime = time.Now()
+	s.loadStates[lineName] = st
 }
 
 // computeLoadFactors 计算各线路的负载惩罚系数 map[lineName]factor。
-// 惩罚是相对的：窗口内选择次数最多的线路 factor = 1-maxLoadPenalty（最重），
-// 最少的线路 factor = 1（无惩罚），其余线性过渡。全部相同或无记录时均返回 1，
-// 避免「所有线路都有玩家」时整体降分。
+// 惩罚是绝对（按容量比例）而非相对：已用容量比例越高惩罚越重。
+// 未配置 max_load 或 count 为 0 的线路不参与惩罚（返回 1）。
 func (s *Selector) computeLoadFactors() map[string]float64 {
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
-	s.pruneSelections(time.Now())
 
-	if len(s.selections) == 0 {
+	if len(s.loadMaxCapacity) == 0 {
 		return nil
 	}
-	min, max := int(^uint(0)>>1), 0
-	for _, ts := range s.selections {
-		c := len(ts)
-		if c < min {
-			min = c
+	factors := make(map[string]float64, len(s.loadMaxCapacity))
+	for name, maxLoad := range s.loadMaxCapacity {
+		if maxLoad <= 0 {
+			continue
 		}
-		if c > max {
-			max = c
+		s.decayLoad(name)
+		st := s.loadStates[name]
+		if st.count <= 0 {
+			continue
 		}
-	}
-	if max == min {
-		return nil // 所有线路负载相同，不施加惩罚
-	}
-
-	factors := make(map[string]float64, len(s.selections))
-	span := float64(max - min)
-	for name, ts := range s.selections {
-		ratio := float64(len(ts)-min) / span // [0,1]，越大越忙
+		ratio := st.count / float64(maxLoad)
+		if ratio > 1 {
+			ratio = 1
+		}
 		factors[name] = 1 - maxLoadPenalty*ratio
 	}
 	return factors
 }
 
-// loadFactor 返回单条线路的负载惩罚系数（读锁安全）。无记录或负载与
-// 其他线路无差异时返回 1。公式与 computeLoadFactors 一致：按相对最忙比例线性惩罚。
+// loadFactor 返回单条线路的负载惩罚系数 [0.85, 1]。
+// 按容量比例计算：count/maxLoad 越高惩罚越重，未配容量或 count=0 时返回 1。
 func (s *Selector) loadFactor(lineName string) float64 {
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
-	s.pruneSelections(time.Now())
 
-	ts, ok := s.selections[lineName]
-	if !ok || len(ts) == 0 || len(s.selections) < 2 {
+	maxLoad, ok := s.loadMaxCapacity[lineName]
+	if !ok || maxLoad <= 0 {
 		return 1
 	}
-	min, max := int(^uint(0)>>1), 0
-	for _, other := range s.selections {
-		c := len(other)
-		if c < min {
-			min = c
-		}
-		if c > max {
-			max = c
-		}
-	}
-	if max == min {
+	s.decayLoad(lineName)
+	st := s.loadStates[lineName]
+	if st.count <= 0 {
 		return 1
 	}
-	ratio := float64(len(ts)-min) / float64(max-min)
+	ratio := st.count / float64(maxLoad)
+	if ratio > 1 {
+		ratio = 1
+	}
 	return 1 - maxLoadPenalty*ratio
 }
 

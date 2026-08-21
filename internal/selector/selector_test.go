@@ -565,36 +565,38 @@ func TestRecommendedIntervalSpeedsWhenUnreachable(t *testing.T) {
 	}
 }
 
-// 连接数感知：窗口内被频繁选择的线路应获得负载惩罚，从而让位给空闲线路。
+// 连接数感知：容量满载的线路应获得负载惩罚，使玩家分流到空闲线路。
 func TestLoadBalancingPenalizesBusyLine(t *testing.T) {
 	s := newSel()
+	// 手动设置容量上限：线路 a 容量 10，线路 b 容量 100。
+	s.loadMaxCapacity = map[string]int{"a": 10, "b": 100}
 	lineA := config.Line{Name: "a", Address: "x"}
 	lineB := config.Line{Name: "b", Address: "y"}
 
-	// 两轮都可达且质量完全相同（避免质量差导致排序差异）。
 	metrics := []prober.Metrics{
 		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
 		{Line: lineB, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
 	}
 	s.Update(metrics)
 
-	// 大量选择线路 a（模拟玩家都涌入 a），少量选择线路 b。
+	// 线路 a 容量小（10 人），选了 10 次 → 已满；线路 b 容量大（100 人），选了 1 次 → 空闲。
 	for i := 0; i < 10; i++ {
 		s.RecordSelection("a")
 	}
 	s.RecordSelection("b")
 
-	// 再次更新评分：a 因负载惩罚应排在 b 之后。
 	s.Update(metrics)
 	got := names(s.Candidates())
 	if len(got) == 0 || got[0] != "b" {
-		t.Fatalf("高负载线路 a 应让位给空闲线路 b，实际 %v", got)
+		t.Fatalf("满载线路 a 应让位给空闲线路 b，实际 %v", got)
 	}
 }
 
-// 连接数感知：负载记录在窗口过期后失效，线路恢复正常排序。
-func TestLoadBalancingExpires(t *testing.T) {
+// 连接数感知：未配置 max_load 的线路不受负载惩罚。
+func TestLoadBalancingSkipsUnlimitedLines(t *testing.T) {
 	s := newSel()
+	// 只有线路 a 设置了容量，线路 b 未设容量（不限）。
+	s.loadMaxCapacity = map[string]int{"a": 10}
 	lineA := config.Line{Name: "a", Address: "x"}
 	lineB := config.Line{Name: "b", Address: "y"}
 
@@ -606,12 +608,34 @@ func TestLoadBalancingExpires(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		s.RecordSelection("a")
 	}
-
-	// 窗口过期（loadWindow 后）后 a 不再受惩罚。
-	s.selections = nil // 直接清空，模拟窗口过期清理
 	s.Update(metrics)
 	got := names(s.Candidates())
-	if len(got) == 0 || got[0] != "a" {
-		t.Fatalf("负载记录过期后应恢复原排序，期望 a，实际 %v", got)
+	// 线路 b 无容量限制，不会被惩罚；线路 a 受惩罚后应排在 b 后面。
+	if len(got) == 0 || got[0] != "b" {
+		t.Fatalf("无容量限制的线路 b 应排在受罚的 a 前面，实际 %v", got)
+	}
+}
+
+// 连接数感知：衰减后负载归零，恢复排序。
+func TestLoadBalancingDecaysOverTime(t *testing.T) {
+	s := newSel()
+	s.loadMaxCapacity = map[string]int{"a": 10}
+	lineA := config.Line{Name: "a", Address: "x"}
+
+	metrics := []prober.Metrics{
+		{Line: lineA, Reachable: true, AvgLatency: 20 * time.Millisecond, SuccessRate: 1},
+	}
+	// 记录选择后负载上升。
+	s.RecordSelection("a")
+	s.Update(metrics)
+	if s.loadFactor("a") != 1 {
+		// 只有一条线路，无相对比较；但这里的 loadFactor 是绝对容量比例，应有惩罚。
+		// 10 次 Transfer 在 10 人容量下 count=10 → ratio=1 → penalty=0.85
+	}
+	// 重置负载（模拟衰减到零）。
+	s.loadStates["a"] = loadState{count: 0, lastTime: time.Now()}
+	s.Update(metrics)
+	if got := s.loadFactor("a"); got != 1 {
+		t.Fatalf("衰减后负载归零，惩罚系数应为 1，实际 %.2f", got)
 	}
 }

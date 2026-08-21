@@ -32,6 +32,10 @@ type Line struct {
 	// 启用 GeoIP 选路时，玩家所在区域命中其中任一标记的线路会被优先选择。
 	// 为空表示不限定区域，可服务任意玩家（作为通用回落线路）。
 	Regions []string `json:"regions"`
+	// MaxLoad 是该线路后端服务器的最大玩家容量。0 表示不限容量（不参与负载惩罚）。
+	// 设置后，选择器按衰减计数器估算在线人数，当已用比例超过 0 时逐步施加惩罚，
+	// 引导新玩家分流到更空闲的线路。
+	MaxLoad int `json:"max_load"`
 }
 
 // Config 是程序的完整配置。
@@ -142,6 +146,9 @@ func (c *Config) validate() error {
 			if !regionPattern.MatchString(region) {
 				return fmt.Errorf("线路 %q 的区域代码 %q 非法，应如 CN-ZJ、HK 或 JP", l.Name, region)
 			}
+		}
+		if l.MaxLoad < 0 {
+			return fmt.Errorf("线路 %q 的 max_load 不能为负", l.Name)
 		}
 		if names[l.Name] {
 			return fmt.Errorf("线路名重复: %q", l.Name)
